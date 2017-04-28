@@ -1,0 +1,6 @@
+[package]
+name = "splitter"
+version = "0.1.0"
+authors = ["Yilin Chen <sticnarf@gmail.com>"]
+
+[dependencies]
