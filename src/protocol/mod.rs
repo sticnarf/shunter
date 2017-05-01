@@ -14,7 +14,7 @@ use self::tokio_proto::streaming::pipeline::{ServerProto, Frame};
 
 use self::tokio_service::Service;
 
-use self::bytes::{BytesMut, ByteOrder, LittleEndian};
+use self::bytes::{BytesMut, ByteOrder, BigEndian};
 
 use std::io;
 
@@ -27,13 +27,15 @@ pub struct SocksCodec {
     stage: Stage,
 }
 
+#[derive(Debug)]
 pub enum AddressType {
     IP_V4,
     DOMAIN_NAME,
     IP_V6,
 }
 
-pub enum DecoderItem {
+#[derive(Debug)]
+pub enum RequestItem {
     NEGOTIATION { methods: Vec<u8> },
     REQUESTING {
         command: RequestCommand,
@@ -43,6 +45,7 @@ pub enum DecoderItem {
     },
 }
 
+#[derive(Debug)]
 enum RequestCommand {
     CONNECT,
     BIND,
@@ -50,7 +53,7 @@ enum RequestCommand {
 }
 
 impl Decoder for SocksCodec {
-    type Item = Frame<DecoderItem, Vec<u8>, io::Error>;
+    type Item = Frame<RequestItem, Vec<u8>, io::Error>;
     type Error = io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, io::Error> {
@@ -63,8 +66,9 @@ impl Decoder for SocksCodec {
                 match head[0] {
                     // SOCKS v5
                     0x05 => {
+                        self.stage = Stage::REQUESTING;
                         Ok(Some(Frame::Message {
-                                    message: DecoderItem::NEGOTIATION {
+                                    message: RequestItem::NEGOTIATION {
                                         methods: buf.split_to(head[1] as usize).to_vec(),
                                     },
                                     body: false,
@@ -90,6 +94,9 @@ impl Decoder for SocksCodec {
                                                           "Unsupported command"))
                             }
                         };
+                        if head[2] != 0x00 {
+                            return Err(io::Error::new(io::ErrorKind::Other, "Wrong reserved code"));
+                        }
                         let (address_type, addr_len) = match head[3] {
                             0x01 => (AddressType::IP_V4, 4),
                             0x04 => (AddressType::IP_V6, 16),
@@ -100,11 +107,11 @@ impl Decoder for SocksCodec {
                             }
                         };
                         Ok(Some(Frame::Message {
-                                    message: DecoderItem::REQUESTING {
+                                    message: RequestItem::REQUESTING {
                                         command: command,
                                         address_type: address_type,
                                         dest_addr: buf.split_to(addr_len as usize).to_vec(),
-                                        dest_port: LittleEndian::read_u16(&buf.split_to(2)),
+                                        dest_port: BigEndian::read_u16(&buf.split_to(2)),
                                     },
                                     body: true,
                                 }))
@@ -121,6 +128,17 @@ impl Encoder for SocksCodec {
     type Error = io::Error;
 
     fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> io::Result<()> {
+        match msg {
+            Frame::Message { message, body } => {
+                buf.extend(&message);
+            }
+            Frame::Body { chunk } => {
+                if let Some(chunk) = chunk {
+                    buf.extend(&chunk);
+                }
+            }
+            Frame::Error { error } => return Err(error),
+        }
         Ok(())
     }
 }
@@ -128,7 +146,7 @@ impl Encoder for SocksCodec {
 pub struct SocksProto;
 
 impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for SocksProto {
-    type Request = DecoderItem;
+    type Request = RequestItem;
     type RequestBody = Vec<u8>;
     type Response = Vec<u8>;
     type ResponseBody = Vec<u8>;
@@ -145,7 +163,7 @@ impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for SocksProto {
 pub struct Proxy;
 
 impl Service for Proxy {
-    type Request = Message<DecoderItem, Body<Vec<u8>, io::Error>>;
+    type Request = Message<RequestItem, Body<Vec<u8>, io::Error>>;
     type Response = Message<Vec<u8>, Body<Vec<u8>, io::Error>>;
 
     type Error = io::Error;
@@ -153,7 +171,29 @@ impl Service for Proxy {
     type Future = BoxFuture<Self::Response, Self::Error>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
-        future::ok(Message::WithoutBody(vec![1, 1, 0])).boxed()
+        println!("{:?}", req);
+        match req {
+            Message::WithoutBody(req) => {
+                match req {
+                    RequestItem::NEGOTIATION { methods } => {
+                        if methods.iter().any(|&x| x == 0x00) {
+                            future::ok(Message::WithoutBody(vec![0x05, 0x00])).boxed()
+                        } else {
+                            future::ok(Message::WithoutBody(vec![0x05, 0xFF])).boxed()
+                        }
+                    }
+                    RequestItem::REQUESTING {
+                        command,
+                        address_type,
+                        dest_addr,
+                        dest_port,
+                    } => {
+                        
+                    }
+                }
+            }
+            _ => unimplemented!(),
+        }
     }
 }
 
