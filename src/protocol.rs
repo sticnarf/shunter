@@ -142,3 +142,16 @@ impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for SocksProto {
     }
 }
 
+pub struct LocalRedirect;
+
+impl Service for LocalRedirect {
+    type Request = Message<IncomingMessage, Body<Vec<u8>, io::Error>>;
+    type Response = Message<OutgoingMessage, Body<Vec<u8>, io::Error>>;
+    type Error = io::Error;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn call(&self, req: Self::Request) -> Self::Future {
+        unimplemented!()
+    }
+}
+
