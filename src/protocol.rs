@@ -55,6 +55,7 @@ enum SocksVersion {
     V5 = 0x05,
 }
 
+#[derive(FromPrimitive)]
 enum SocksCommand {
     Connect = 0x01,
     Bind = 0x02,
@@ -81,14 +82,12 @@ impl SocksCodec {
                           -> Result<Option<<Self as Decoder>::Item>, io::Error> {
         let len = buf.len();
         if len < 3 {
-            // An incomplete head is received
             return Ok(None);
         }
 
         let nmethods = buf[1];
         let full_len = nmethods as usize + 2;
         if len < full_len {
-            // An incomplete head is received
             return Ok(None);
         }
 
@@ -114,7 +113,74 @@ impl SocksCodec {
     fn decode_request(&mut self,
                       buf: &mut BytesMut)
                       -> Result<Option<<Self as Decoder>::Item>, io::Error> {
-        unimplemented!()
+        let len = buf.len();
+        if len < 8 {
+            return Ok(None);
+        }
+
+        let version = match FromPrimitive::from_u8(buf[0]) {
+            Some(v) => v,
+            None => return Err(io::Error::new(io::ErrorKind::Other, "Unknown protocol version")),
+        };
+
+        let command = match FromPrimitive::from_u8(buf[1]) {
+            Some(v) => v,
+            None => return Err(io::Error::new(io::ErrorKind::Other, "Unknown command")),
+        };
+
+        if buf[2] != 0x00 {
+            // RSV must be X'00'
+            return Err(io::Error::new(io::ErrorKind::Other, "Wrong RSV code"));
+        }
+
+        let full_len = match buf[3] {
+            0x01 => 10,
+            0x03 => buf[5] as usize + 7,
+            0x04 => 22,
+            _ => return Err(io::Error::new(io::ErrorKind::Other, "Unknown ATYP code")),
+        };
+        if len < full_len {
+            return Ok(None);
+        }
+
+        let dst_addr = match buf[3] {
+            0x01 => AddressType::Ipv4(Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7])),
+            0x03 => {
+                AddressType::DomainName(match String::from_utf8(buf[6..(6 + buf[5] as usize)]
+                                                                    .to_vec()) {
+                                            Ok(s) => s,
+                                            Err(_) => {
+                                                return Err(io::Error::new(io::ErrorKind::Other,
+                                                                          "Invalid domain name"))
+                                            }
+                                        })
+            }
+            0x04 => {
+                AddressType::Ipv6(Ipv6Addr::new((buf[4] as u16) << 8 | (buf[5] as u16),
+                                                (buf[6] as u16) << 8 | (buf[7] as u16),
+                                                (buf[8] as u16) << 8 | (buf[9] as u16),
+                                                (buf[10] as u16) << 8 | (buf[11] as u16),
+                                                (buf[12] as u16) << 8 | (buf[13] as u16),
+                                                (buf[14] as u16) << 8 | (buf[15] as u16),
+                                                (buf[16] as u16) << 8 | (buf[17] as u16),
+                                                (buf[18] as u16) << 8 | (buf[19] as u16)))
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::Other, "Unknown ATYP code")),
+        };
+
+        let port = (buf[full_len - 2] as u16) << 8 | (buf[full_len - 1] as u16);
+
+        let message = RequestMessage {
+            ver: version,
+            cmd: command,
+            dst_addr: dst_addr,
+            port: port,
+        };
+
+        Ok(Some(Frame::Message {
+                    message: IncomingMessage::Request(message),
+                    body: true,
+                }))
     }
 }
 
