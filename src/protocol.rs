@@ -1,9 +1,10 @@
-use futures::BoxFuture;
+use futures::{future, BoxFuture};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Framed, Decoder, Encoder};
 use tokio_proto::streaming::{Body, Message};
 use tokio_proto::streaming::pipeline::{ServerProto, Frame};
 use tokio_service::Service;
+use tokio_core::reactor::Core;
 use bytes::{BytesMut, BufMut, BigEndian};
 use num::FromPrimitive;
 use std::io;
@@ -174,7 +175,7 @@ impl SocksCodec {
                                                 (buf[16] as u16) << 8 | (buf[17] as u16),
                                                 (buf[18] as u16) << 8 | (buf[19] as u16)))
             }
-            _ => return Err(io::Error::new(io::ErrorKind::Other, "Unknown ATYP code")),
+            _ => unreachable!(),
         };
 
         let port = (buf[full_len - 2] as u16) << 8 | (buf[full_len - 1] as u16);
@@ -276,7 +277,9 @@ impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for SocksProto {
     }
 }
 
-pub struct LocalRedirect;
+pub struct LocalRedirect {
+    pub ev_loop: Core,
+}
 
 impl Service for LocalRedirect {
     type Request = Message<IncomingMessage, Body<Vec<u8>, io::Error>>;
@@ -285,6 +288,57 @@ impl Service for LocalRedirect {
     type Future = BoxFuture<Self::Response, Self::Error>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
+        match req {
+            Message::WithoutBody(msg) => {
+                match msg {
+                    IncomingMessage::Negotiation(msg) => self.serve_negotiation(msg),
+                    IncomingMessage::Request(_) => {
+                        return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
+                                                                   "Body missing")))
+                    }
+                }
+            }
+            Message::WithBody(msg, body) => {
+                match msg {
+                    IncomingMessage::Negotiation(_) => {
+                        return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
+                                                                   "Unexpected body")))
+                    }
+                    IncomingMessage::Request(msg) => self.serve_request(msg, body),
+                }
+            }
+        }
+    }
+}
+
+impl LocalRedirect {
+    fn serve_negotiation(&self, msg: IncomingNegotiationMessage) -> <Self as Service>::Future {
+        let ver = if (msg.ver as u8) == 0x05 {
+            SocksVersion::V5
+        } else {
+            return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
+                                                       "Unsupported socks version")));
+        };
+
+        // No authentication method is supported yet
+        let method = if msg.methods.iter().any(|&m| m == 0x00) {
+            0x00
+        } else {
+            0xFF
+        };
+
+        let message = OutgoingMessage::Negotiation(OutgoingNegotiationMessage {
+                                                       ver: ver,
+                                                       method: method,
+                                                   });
+
+        Box::new(future::ok(Message::WithoutBody(message)))
+    }
+
+    fn serve_request(&self,
+                     msg: IncomingRequestMessage,
+                     body: Body<Vec<u8>, io::Error>)
+                     -> <Self as Service>::Future {
         unimplemented!()
     }
 }

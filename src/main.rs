@@ -9,6 +9,7 @@ extern crate num;
 extern crate num_derive;
 
 use tokio_proto::TcpServer;
+use tokio_core::reactor::Core;
 
 mod protocol;
 
@@ -19,6 +20,10 @@ fn main() {
 
     let server = TcpServer::new(protocol::SocksProto, addr);
 
-    server.serve(|| Ok(protocol::LocalRedirect));
+    server.serve(|| {
+                     Ok(protocol::LocalRedirect {
+                            ev_loop: Core::new().expect("Unable to create an event loop"),
+                        })
+                 });
 }
 
