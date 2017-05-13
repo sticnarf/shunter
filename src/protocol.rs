@@ -1,36 +1,46 @@
-use futures::{future, Future, BoxFuture, Stream};
+use futures::BoxFuture;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Framed, Decoder, Encoder};
 use tokio_proto::streaming::{Body, Message};
 use tokio_proto::streaming::pipeline::{ServerProto, Frame};
 use tokio_service::Service;
-use tokio_core::reactor::{Core, Handle};
-use tokio_core::net::TcpStream;
-use bytes::{BytesMut, ByteOrder, BigEndian};
+use bytes::{BytesMut, BufMut, BigEndian};
 use num::FromPrimitive;
 use std::io;
-use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub enum IncomingMessage {
-    Negotiation(NegotiationMessage),
-    Request(RequestMessage),
+    Negotiation(IncomingNegotiationMessage),
+    Request(IncomingRequestMessage),
 }
 
 pub enum OutgoingMessage {
-
+    Negotiation(OutgoingNegotiationMessage),
+    Request(OutgoingRequestMessage),
 }
 
 // Property names come after RFC 1928
-struct NegotiationMessage {
+pub struct IncomingNegotiationMessage {
     ver: SocksVersion,
     methods: Vec<u8>,
 }
 
-struct RequestMessage {
+pub struct IncomingRequestMessage {
     ver: SocksVersion,
     cmd: SocksCommand,
     dst_addr: AddressType,
+    port: u16,
+}
+
+pub struct OutgoingNegotiationMessage {
+    ver: SocksVersion,
+    method: u8,
+}
+
+pub struct OutgoingRequestMessage {
+    ver: SocksVersion,
+    rep: u8,
+    bnd_addr: AddressType,
     port: u16,
 }
 
@@ -96,7 +106,7 @@ impl SocksCodec {
             None => return Err(io::Error::new(io::ErrorKind::Other, "Unknown protocol version")),
         };
 
-        let message = NegotiationMessage {
+        let message = IncomingNegotiationMessage {
             ver: version,
             methods: buf[2..full_len].to_vec(),
         };
@@ -146,19 +156,18 @@ impl SocksCodec {
         let dst_addr = match buf[3] {
             0x01 => AddressType::Ipv4(Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7])),
             0x03 => {
-                AddressType::DomainName(match String::from_utf8(buf[6..(6 + buf[5] as usize)]
-                                                                    .to_vec()) {
-                                            Ok(s) => s,
-                                            Err(_) => {
-                                                return Err(io::Error::new(io::ErrorKind::Other,
-                                                                          "Invalid domain name"))
-                                            }
-                                        })
+                let domain_name = match String::from_utf8(buf[6..(6 + buf[5] as usize)].to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::Other, "Invalid domain name"))
+                    }
+                };
+                AddressType::DomainName(domain_name)
             }
             0x04 => {
-                AddressType::Ipv6(Ipv6Addr::new((buf[4] as u16) << 8 | (buf[5] as u16),
-                                                (buf[6] as u16) << 8 | (buf[7] as u16),
-                                                (buf[8] as u16) << 8 | (buf[9] as u16),
+                AddressType::Ipv6(Ipv6Addr::new((buf[04] as u16) << 8 | (buf[05] as u16),
+                                                (buf[06] as u16) << 8 | (buf[07] as u16),
+                                                (buf[08] as u16) << 8 | (buf[09] as u16),
                                                 (buf[10] as u16) << 8 | (buf[11] as u16),
                                                 (buf[12] as u16) << 8 | (buf[13] as u16),
                                                 (buf[14] as u16) << 8 | (buf[15] as u16),
@@ -170,7 +179,7 @@ impl SocksCodec {
 
         let port = (buf[full_len - 2] as u16) << 8 | (buf[full_len - 1] as u16);
 
-        let message = RequestMessage {
+        let message = IncomingRequestMessage {
             ver: version,
             cmd: command,
             dst_addr: dst_addr,
@@ -189,7 +198,66 @@ impl Encoder for SocksCodec {
     type Error = io::Error;
 
     fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> io::Result<()> {
-        unimplemented!()
+        match msg {
+            Frame::Message { message, body } => {
+                match message {
+                    OutgoingMessage::Negotiation(msg) => self.encode_negotiation(msg, body, buf),
+                    OutgoingMessage::Request(msg) => self.encode_request(msg, body, buf),
+                }
+            }
+            Frame::Body { chunk } => {
+                match chunk {
+                    Some(chunk) => self.encode_body(chunk, buf),
+                    None => Ok(()),
+                }
+            }
+            Frame::Error { error } => Err(error),
+        }
+    }
+}
+
+impl SocksCodec {
+    fn encode_negotiation(&mut self,
+                          msg: OutgoingNegotiationMessage,
+                          body: bool,
+                          buf: &mut BytesMut)
+                          -> io::Result<()> {
+        assert!(!body);
+        buf.put_u8(msg.ver as u8);
+        buf.put_u8(msg.method);
+        Ok(())
+    }
+
+    fn encode_request(&mut self,
+                      msg: OutgoingRequestMessage,
+                      body: bool,
+                      buf: &mut BytesMut)
+                      -> io::Result<()> {
+        buf.put_u8(msg.ver as u8);
+        buf.put_u8(msg.rep);
+        buf.put_u8(0x00);
+        match msg.bnd_addr {
+            AddressType::Ipv4(ip) => {
+                buf.put_u8(0x01);
+                buf.extend(&ip.octets());
+            }
+            AddressType::Ipv6(ip) => {
+                buf.put_u8(0x04);
+                buf.extend(&ip.octets());
+            }
+            AddressType::DomainName(domain_name) => {
+                buf.put_u8(0x03);
+                buf.put_u8(domain_name.len() as u8);
+                buf.extend(domain_name.as_bytes());
+            }
+        };
+        buf.put_u16::<BigEndian>(msg.port);
+        Ok(())
+    }
+
+    fn encode_body(&mut self, msg: Vec<u8>, buf: &mut BytesMut) -> io::Result<()> {
+        buf.extend(&msg);
+        Ok(())
     }
 }
 
