@@ -1,14 +1,19 @@
-use futures::{future, BoxFuture};
+use futures::{future, Future, BoxFuture};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Framed, Decoder, Encoder};
 use tokio_proto::streaming::{Body, Message};
 use tokio_proto::streaming::pipeline::{ServerProto, Frame};
 use tokio_service::Service;
-use tokio_core::reactor::Core;
+use tokio_core::reactor::Handle;
 use bytes::{BytesMut, BufMut, BigEndian};
+use trust_dns::client::{BasicClientHandle, ClientFuture, ClientHandle};
+use trust_dns::udp::UdpClientStream;
+use trust_dns::rr::{Name, DNSClass, RecordType, RData};
+use trust_dns::op::ResponseCode;
 use num::FromPrimitive;
+use std::str;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, IpAddr};
 
 pub enum IncomingMessage {
     Negotiation(IncomingNegotiationMessage),
@@ -55,18 +60,17 @@ pub struct SocksCodec {
 }
 
 enum AddressType {
-    Ipv4(Ipv4Addr),
-    Ipv6(Ipv6Addr),
-    DomainName(String),
+    Ip(IpAddr),
+    DomainName(Name),
 }
 
-#[derive(FromPrimitive)]
+#[derive(Copy, Clone, PartialEq, FromPrimitive)]
 enum SocksVersion {
     V4 = 0x04,
     V5 = 0x05,
 }
 
-#[derive(FromPrimitive)]
+#[derive(Copy, Clone, PartialEq, FromPrimitive)]
 enum SocksCommand {
     Connect = 0x01,
     Bind = 0x02,
@@ -155,10 +159,16 @@ impl SocksCodec {
         }
 
         let dst_addr = match buf[3] {
-            0x01 => AddressType::Ipv4(Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7])),
+            0x01 => AddressType::Ip(IpAddr::V4(Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]))),
             0x03 => {
-                let domain_name = match String::from_utf8(buf[6..(6 + buf[5] as usize)].to_vec()) {
+                let domain_name = match str::from_utf8(&buf[6..(6 + buf[5] as usize)]) {
                     Ok(s) => s,
+                    Err(_) => {
+                        return Err(io::Error::new(io::ErrorKind::Other, "Invalid domain name"))
+                    }
+                };
+                let domain_name = match Name::parse(domain_name, None) {
+                    Ok(name) => name,
                     Err(_) => {
                         return Err(io::Error::new(io::ErrorKind::Other, "Invalid domain name"))
                     }
@@ -166,14 +176,14 @@ impl SocksCodec {
                 AddressType::DomainName(domain_name)
             }
             0x04 => {
-                AddressType::Ipv6(Ipv6Addr::new((buf[04] as u16) << 8 | (buf[05] as u16),
-                                                (buf[06] as u16) << 8 | (buf[07] as u16),
-                                                (buf[08] as u16) << 8 | (buf[09] as u16),
-                                                (buf[10] as u16) << 8 | (buf[11] as u16),
-                                                (buf[12] as u16) << 8 | (buf[13] as u16),
-                                                (buf[14] as u16) << 8 | (buf[15] as u16),
-                                                (buf[16] as u16) << 8 | (buf[17] as u16),
-                                                (buf[18] as u16) << 8 | (buf[19] as u16)))
+                AddressType::Ip(IpAddr::V6(Ipv6Addr::new((buf[04] as u16) << 8 | (buf[05] as u16),
+                                                         (buf[06] as u16) << 8 | (buf[07] as u16),
+                                                         (buf[08] as u16) << 8 | (buf[09] as u16),
+                                                         (buf[10] as u16) << 8 | (buf[11] as u16),
+                                                         (buf[12] as u16) << 8 | (buf[13] as u16),
+                                                         (buf[14] as u16) << 8 | (buf[15] as u16),
+                                                         (buf[16] as u16) << 8 | (buf[17] as u16),
+                                                         (buf[18] as u16) << 8 | (buf[19] as u16))))
             }
             _ => unreachable!(),
         };
@@ -238,19 +248,25 @@ impl SocksCodec {
         buf.put_u8(msg.rep);
         buf.put_u8(0x00);
         match msg.bnd_addr {
-            AddressType::Ipv4(ip) => {
-                buf.put_u8(0x01);
-                buf.extend(&ip.octets());
+            AddressType::Ip(ip) => {
+                match ip {
+                    IpAddr::V4(ip) => {
+                        buf.put_u8(0x01);
+                        buf.extend(&ip.octets());
+                    }
+                    IpAddr::V6(ip) => {
+                        buf.put_u8(0x04);
+                        buf.extend(&ip.octets());
+                    }
+                }
             }
-            AddressType::Ipv6(ip) => {
-                buf.put_u8(0x04);
-                buf.extend(&ip.octets());
-            }
-            AddressType::DomainName(domain_name) => {
-                buf.put_u8(0x03);
-                buf.put_u8(domain_name.len() as u8);
-                buf.extend(domain_name.as_bytes());
-            }
+
+            // AddressType::DomainName(domain_name) => {
+            //     buf.put_u8(0x03);
+            //     buf.put_u8(domain_name.len() as u8);
+            //     buf.extend(domain_name.to_string().as_bytes());
+            // }
+            AddressType::DomainName(_) => unreachable!(),
         };
         buf.put_u16::<BigEndian>(msg.port);
         Ok(())
@@ -278,7 +294,8 @@ impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for SocksProto {
 }
 
 pub struct LocalRedirect {
-    pub ev_loop: Core,
+    pub ev_handle: Handle,
+    pub dns_client: BasicClientHandle,
 }
 
 impl Service for LocalRedirect {
@@ -313,9 +330,8 @@ impl Service for LocalRedirect {
 
 impl LocalRedirect {
     fn serve_negotiation(&self, msg: IncomingNegotiationMessage) -> <Self as Service>::Future {
-        let ver = if (msg.ver as u8) == 0x05 {
-            SocksVersion::V5
-        } else {
+        // Only Socks5 is supported
+        if msg.ver != SocksVersion::V5 {
             return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
                                                        "Unsupported socks version")));
         };
@@ -328,7 +344,7 @@ impl LocalRedirect {
         };
 
         let message = OutgoingMessage::Negotiation(OutgoingNegotiationMessage {
-                                                       ver: ver,
+                                                       ver: msg.ver,
                                                        method: method,
                                                    });
 
@@ -339,7 +355,59 @@ impl LocalRedirect {
                      msg: IncomingRequestMessage,
                      body: Body<Vec<u8>, io::Error>)
                      -> <Self as Service>::Future {
+        // Only Socks5 is supported
+        if msg.ver != SocksVersion::V5 {
+            return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
+                                                       "Unsupported socks version")));
+        };
+
+        // Only CONNECT command is supported
+        if msg.cmd != SocksCommand::Connect {
+            return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
+                                                       "Unsupported command")));
+        };
+
+        let addr = self.resolve_addr(msg.dst_addr);
+
         unimplemented!()
     }
+
+    fn resolve_addr(&self,
+                    addr: AddressType)
+                    -> Box<Future<Item = AddressType, Error = io::Error>> {
+        match addr {
+            AddressType::Ip(_) => future::ok(addr).boxed(),
+            AddressType::DomainName(domain_name) => {
+                let mut dns_client = self.dns_client.clone();
+                let record = dns_client
+                    .query(domain_name, DNSClass::IN, RecordType::A)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, "DNS error"))
+                    .and_then(|m| if m.response_code() != ResponseCode::NoError {
+                                  future::err(io::Error::new(io::ErrorKind::Other, "DNS error"))
+                              } else {
+                                  let ip = m.answers()
+                                      .iter()
+                                      .filter_map(|record| match record.rdata() {
+                                                      &RData::A(ip) => Some(IpAddr::V4(ip)),
+                                                      &RData::AAAA(ip) => Some(IpAddr::V6(ip)),
+                                                      _ => None,
+                                                  })
+                                      .next();
+                                  match ip {
+                                      Some(ip) => future::ok(AddressType::Ip(ip)),
+                                      None => {
+                                          future::err(io::Error::new(io::ErrorKind::Other,
+                                                                     "DNS record not found"))
+                                      }
+                                  }
+                              });
+                static_box_future(record)
+            }
+        }
+    }
+}
+
+fn static_box_future<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
+    Box::new(f)
 }
 
