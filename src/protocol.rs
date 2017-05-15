@@ -1,13 +1,13 @@
-use futures::{future, Future, BoxFuture};
+use futures::{future, Future, BoxFuture, Stream, Poll, Async};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Framed, Decoder, Encoder};
 use tokio_proto::streaming::{Body, Message};
 use tokio_proto::streaming::pipeline::{ServerProto, Frame};
 use tokio_service::Service;
 use tokio_core::reactor::Handle;
+use tokio_core::net::TcpStream;
 use bytes::{BytesMut, BufMut, BigEndian};
-use trust_dns::client::{BasicClientHandle, ClientFuture, ClientHandle};
-use trust_dns::udp::UdpClientStream;
+use trust_dns::client::{BasicClientHandle, ClientHandle};
 use trust_dns::rr::{Name, DNSClass, RecordType, RData};
 use trust_dns::op::ResponseCode;
 use num::FromPrimitive;
@@ -15,6 +15,7 @@ use std::str;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, IpAddr};
 
+#[derive(Clone)]
 pub enum IncomingMessage {
     Negotiation(IncomingNegotiationMessage),
     Request(IncomingRequestMessage),
@@ -26,11 +27,13 @@ pub enum OutgoingMessage {
 }
 
 // Property names come after RFC 1928
+#[derive(Clone)]
 pub struct IncomingNegotiationMessage {
     ver: SocksVersion,
     methods: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct IncomingRequestMessage {
     ver: SocksVersion,
     cmd: SocksCommand,
@@ -59,6 +62,7 @@ pub struct SocksCodec {
     stage: Stage,
 }
 
+#[derive(Clone)]
 enum AddressType {
     Ip(IpAddr),
     DomainName(Name),
@@ -367,16 +371,24 @@ impl LocalRedirect {
                                                        "Unsupported command")));
         };
 
-        let addr = self.resolve_addr(msg.dst_addr);
+        let addr = self.resolve_addr(msg.dst_addr.clone())
+            .map(|ip| (ip, SocketAddr::new(ip, msg.port)));
+
+        let conn = addr.map(|(ip, addr)| {
+                                let conn = TcpStream::connect(&addr, &self.ev_handle.clone())
+                                    .map_err(|e| {
+                                                 io::Error::new(io::ErrorKind::Other,
+                                                                "Connection error")
+                                             });
+                                (ip, conn)
+                            });
 
         unimplemented!()
     }
 
-    fn resolve_addr(&self,
-                    addr: AddressType)
-                    -> Box<Future<Item = AddressType, Error = io::Error>> {
+    fn resolve_addr(&self, addr: AddressType) -> Box<Future<Item = IpAddr, Error = io::Error>> {
         match addr {
-            AddressType::Ip(_) => future::ok(addr).boxed(),
+            AddressType::Ip(addr) => future::ok(addr).boxed(),
             AddressType::DomainName(domain_name) => {
                 let mut dns_client = self.dns_client.clone();
                 let record = dns_client
@@ -394,7 +406,7 @@ impl LocalRedirect {
                                                   })
                                       .next();
                                   match ip {
-                                      Some(ip) => future::ok(AddressType::Ip(ip)),
+                                      Some(ip) => future::ok(ip),
                                       None => {
                                           future::err(io::Error::new(io::ErrorKind::Other,
                                                                      "DNS record not found"))

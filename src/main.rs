@@ -17,8 +17,6 @@ use trust_dns::client::ClientFuture;
 mod protocol;
 
 fn main() {
-
-
     let addr = "0.0.0.0:12345"
         .parse()
         .expect("Parse binding address error");
@@ -29,9 +27,7 @@ fn main() {
         let ev_loop = Core::new().expect("Unable to create an event loop");
 
         // Default DNS server
-        let dns_addr = "192.168.1.1:53"
-            .parse()
-            .expect("Parse dns address error");
+        let dns_addr = "192.168.1.1:53".parse().expect("Parse dns address error");
         let (stream, sender) = UdpClientStream::new(dns_addr, ev_loop.handle());
         let dns_client = ClientFuture::new(stream, sender, ev_loop.handle(), None);
 
