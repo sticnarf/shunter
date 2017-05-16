@@ -1,4 +1,4 @@
-use futures::{future, Future, BoxFuture, Stream, Poll, Async};
+use futures::{future, Future, Stream, Sink};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Framed, Decoder, Encoder};
 use tokio_proto::streaming::{Body, Message};
@@ -306,7 +306,7 @@ impl Service for LocalRedirect {
     type Request = Message<IncomingMessage, Body<Vec<u8>, io::Error>>;
     type Response = Message<OutgoingMessage, Body<Vec<u8>, io::Error>>;
     type Error = io::Error;
-    type Future = BoxFuture<Self::Response, Self::Error>;
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
         match req {
@@ -371,24 +371,42 @@ impl LocalRedirect {
                                                        "Unsupported command")));
         };
 
-        let addr = self.resolve_addr(msg.dst_addr.clone())
-            .map(|ip| (ip, SocketAddr::new(ip, msg.port)));
+        let port = msg.port;
 
-        let conn = addr.map(|(ip, addr)| {
-                                let conn = TcpStream::connect(&addr, &self.ev_handle.clone())
-                                    .map_err(|e| {
-                                                 io::Error::new(io::ErrorKind::Other,
-                                                                "Connection error")
-                                             });
-                                (ip, conn)
-                            });
+        let addr = Box::new(self.resolve_addr(msg.dst_addr)
+                                .map(move |ip| (ip, SocketAddr::new(ip, port))));
 
-        unimplemented!()
+        let handle = self.ev_handle.clone();
+
+        let transfer = addr.map(move |(ip, addr)| {
+                TcpStream::connect(&addr, &handle)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, "Connection error"))
+                    .map(move |conn| {
+                        let (sender, client_body) = Body::<Vec<u8>, io::Error>::pair();
+                        let framed = conn.framed(RedirectCodec);
+                        let (sink, stream) = framed.split();
+                        let from_client = sink.send_all(body);
+                        let to_client = sender
+                            .sink_map_err(|e| io::Error::new(io::ErrorKind::Other, "Sender error"))
+                            .send_all(stream);
+                        from_client.join(to_client);
+                        let msg = OutgoingRequestMessage {
+                            ver: SocksVersion::V5,
+                            rep: 0x00,
+                            bnd_addr: AddressType::Ip(ip),
+                            port: port,
+                        };
+                        Message::WithBody(OutgoingMessage::Request(msg), client_body)
+                    })
+
+            })
+            .and_then(|msg| msg);
+        Box::new(transfer)
     }
 
     fn resolve_addr(&self, addr: AddressType) -> Box<Future<Item = IpAddr, Error = io::Error>> {
         match addr {
-            AddressType::Ip(addr) => future::ok(addr).boxed(),
+            AddressType::Ip(addr) => Box::new(future::ok(addr)),
             AddressType::DomainName(domain_name) => {
                 let mut dns_client = self.dns_client.clone();
                 let record = dns_client
@@ -413,13 +431,35 @@ impl LocalRedirect {
                                       }
                                   }
                               });
-                static_box_future(record)
+                Box::new(record)
+                // record.boxed()
             }
         }
     }
 }
 
-fn static_box_future<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
-    Box::new(f)
+pub struct RedirectCodec;
+
+impl Decoder for RedirectCodec {
+    type Item = Result<Vec<u8>, io::Error>;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, io::Error> {
+        let buf = buf.take();
+        if buf.len() > 0 {
+            Ok(Some(Ok(buf.to_vec())))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Encoder for RedirectCodec {
+    type Item = Vec<u8>;
+    type Error = io::Error;
+    fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> io::Result<()> {
+        buf.extend(&msg);
+        Ok(())
+    }
 }
 
