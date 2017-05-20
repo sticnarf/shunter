@@ -4,36 +4,44 @@ use tokio_io::codec::{Framed, Decoder, Encoder};
 use tokio_proto::streaming::{Body, Message};
 use tokio_proto::streaming::pipeline::{ServerProto, Frame};
 use tokio_service::Service;
-use tokio_core::reactor::Handle;
+use tokio_core::reactor::{Core, Handle};
 use tokio_core::net::TcpStream;
 use bytes::{BytesMut, BufMut, BigEndian};
 use trust_dns::client::{BasicClientHandle, ClientHandle};
 use trust_dns::rr::{Name, DNSClass, RecordType, RData};
 use trust_dns::op::ResponseCode;
+use trust_dns::udp::UdpClientStream;
+use trust_dns::client::ClientFuture;
 use num::FromPrimitive;
 use std::str;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, IpAddr};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum IncomingMessage {
     Negotiation(IncomingNegotiationMessage),
     Request(IncomingRequestMessage),
+    Transfer,
 }
 
+#[derive(Debug)]
 pub enum OutgoingMessage {
     Negotiation(OutgoingNegotiationMessage),
     Request(OutgoingRequestMessage),
+    Transfer,
 }
 
 // Property names come after RFC 1928
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IncomingNegotiationMessage {
     ver: SocksVersion,
     methods: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IncomingRequestMessage {
     ver: SocksVersion,
     cmd: SocksCommand,
@@ -41,11 +49,13 @@ pub struct IncomingRequestMessage {
     port: u16,
 }
 
+#[derive(Debug)]
 pub struct OutgoingNegotiationMessage {
     ver: SocksVersion,
     method: u8,
 }
 
+#[derive(Debug)]
 pub struct OutgoingRequestMessage {
     ver: SocksVersion,
     rep: u8,
@@ -56,25 +66,27 @@ pub struct OutgoingRequestMessage {
 enum Stage {
     Negotiation,
     Request,
+    Transfer,
+    Pos,
 }
 
 pub struct SocksCodec {
     stage: Stage,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum AddressType {
     Ip(IpAddr),
     DomainName(Name),
 }
 
-#[derive(Copy, Clone, PartialEq, FromPrimitive)]
+#[derive(Copy, Clone, PartialEq, FromPrimitive, Debug)]
 enum SocksVersion {
     V4 = 0x04,
     V5 = 0x05,
 }
 
-#[derive(Copy, Clone, PartialEq, FromPrimitive)]
+#[derive(Copy, Clone, PartialEq, FromPrimitive, Debug)]
 enum SocksCommand {
     Connect = 0x01,
     Bind = 0x02,
@@ -88,9 +100,12 @@ impl Decoder for SocksCodec {
     type Error = io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, io::Error> {
+        debug!("decode buf: {:?}", buf);
         match self.stage {
             Stage::Negotiation => self.decode_negotiation(buf),
             Stage::Request => self.decode_request(buf),
+            Stage::Transfer => self.decode_transfer(buf),
+            Stage::Pos => Ok(None),
         }
     }
 }
@@ -201,8 +216,25 @@ impl SocksCodec {
             port: port,
         };
 
+        buf.split_to(full_len);
+
+        self.stage = Stage::Transfer;
+
         Ok(Some(Frame::Message {
                     message: IncomingMessage::Request(message),
+                    body: false,
+                }))
+    }
+
+    fn decode_transfer(&mut self,
+                       buf: &mut BytesMut)
+                       -> Result<Option<<Self as Decoder>::Item>, io::Error> {
+        if buf.len() == 0 {
+            return Ok(None);
+        }
+        self.stage = Stage::Pos;
+        Ok(Some(Frame::Message {
+                    message: IncomingMessage::Transfer,
                     body: true,
                 }))
     }
@@ -213,11 +245,13 @@ impl Encoder for SocksCodec {
     type Error = io::Error;
 
     fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> io::Result<()> {
+        debug!("encode msg: {:?}", msg);
         match msg {
             Frame::Message { message, body } => {
                 match message {
                     OutgoingMessage::Negotiation(msg) => self.encode_negotiation(msg, body, buf),
                     OutgoingMessage::Request(msg) => self.encode_request(msg, body, buf),
+                    OutgoingMessage::Transfer => Ok(()),
                 }
             }
             Frame::Body { chunk } => {
@@ -264,12 +298,6 @@ impl SocksCodec {
                     }
                 }
             }
-
-            // AddressType::DomainName(domain_name) => {
-            //     buf.put_u8(0x03);
-            //     buf.put_u8(domain_name.len() as u8);
-            //     buf.extend(domain_name.to_string().as_bytes());
-            // }
             AddressType::DomainName(_) => unreachable!(),
         };
         buf.put_u16::<BigEndian>(msg.port);
@@ -298,8 +326,30 @@ impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for SocksProto {
 }
 
 pub struct LocalRedirect {
-    pub ev_handle: Handle,
-    pub dns_client: BasicClientHandle,
+    ev_loop: Rc<RefCell<Core>>,
+    dns_client: BasicClientHandle,
+    remote_tx: Sender<TcpStream>,
+    remote_rx: Receiver<TcpStream>,
+}
+
+impl LocalRedirect {
+    pub fn new() -> LocalRedirect {
+        debug!("New LocalRedirect!");
+        let ev_loop = Core::new().expect("Unable to create an event loop");
+
+        // Default DNS server
+        let dns_addr = "192.168.1.1:53".parse().expect("Parse dns address error");
+        let (stream, sender) = UdpClientStream::new(dns_addr, ev_loop.handle());
+        let dns_client = ClientFuture::new(stream, sender, ev_loop.handle(), None);
+        let (tx, rx) = channel();
+
+        LocalRedirect {
+            ev_loop: Rc::new(RefCell::new(ev_loop)),
+            dns_client: dns_client,
+            remote_tx: tx,
+            remote_rx: rx,
+        }
+    }
 }
 
 impl Service for LocalRedirect {
@@ -309,11 +359,13 @@ impl Service for LocalRedirect {
     type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn call(&self, req: Self::Request) -> Self::Future {
+        debug!("Call Request: {:?}", req);
         match req {
             Message::WithoutBody(msg) => {
                 match msg {
                     IncomingMessage::Negotiation(msg) => self.serve_negotiation(msg),
-                    IncomingMessage::Request(_) => {
+                    IncomingMessage::Request(msg) => self.serve_request(msg),
+                    IncomingMessage::Transfer => {
                         return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
                                                                    "Body missing")))
                     }
@@ -321,11 +373,12 @@ impl Service for LocalRedirect {
             }
             Message::WithBody(msg, body) => {
                 match msg {
-                    IncomingMessage::Negotiation(_) => {
+                    IncomingMessage::Transfer => self.serve_transfer(body),
+                    _ => {
+                        debug!("Unexpected body");
                         return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
-                                                                   "Unexpected body")))
+                                                                   "Unexpected body")));
                     }
-                    IncomingMessage::Request(msg) => self.serve_request(msg, body),
                 }
             }
         }
@@ -346,19 +399,16 @@ impl LocalRedirect {
         } else {
             0xFF
         };
-
+        debug!("{:?}", msg);
         let message = OutgoingMessage::Negotiation(OutgoingNegotiationMessage {
                                                        ver: msg.ver,
                                                        method: method,
                                                    });
-
+        debug!("{:?}", message);
         Box::new(future::ok(Message::WithoutBody(message)))
     }
 
-    fn serve_request(&self,
-                     msg: IncomingRequestMessage,
-                     body: Body<Vec<u8>, io::Error>)
-                     -> <Self as Service>::Future {
+    fn serve_request(&self, msg: IncomingRequestMessage) -> <Self as Service>::Future {
         // Only Socks5 is supported
         if msg.ver != SocksVersion::V5 {
             return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
@@ -370,38 +420,57 @@ impl LocalRedirect {
             return Box::new(future::err(io::Error::new(io::ErrorKind::Other,
                                                        "Unsupported command")));
         };
-
+        debug!("{:?}", msg);
         let port = msg.port;
 
-        let addr = Box::new(self.resolve_addr(msg.dst_addr)
-                                .map(move |ip| (ip, SocketAddr::new(ip, port))));
+        let core = self.ev_loop.clone();
+        let remote_tx = self.remote_tx.clone();
 
-        let handle = self.ev_handle.clone();
-
-        let transfer = addr.map(move |(ip, addr)| {
-                TcpStream::connect(&addr, &handle)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, "Connection error"))
-                    .map(move |conn| {
-                        let (sender, client_body) = Body::<Vec<u8>, io::Error>::pair();
-                        let framed = conn.framed(RedirectCodec);
-                        let (sink, stream) = framed.split();
-                        let from_client = sink.send_all(body);
-                        let to_client = sender
-                            .sink_map_err(|e| io::Error::new(io::ErrorKind::Other, "Sender error"))
-                            .send_all(stream);
-                        from_client.join(to_client);
-                        let msg = OutgoingRequestMessage {
-                            ver: SocksVersion::V5,
-                            rep: 0x00,
-                            bnd_addr: AddressType::Ip(ip),
-                            port: port,
-                        };
-                        Message::WithBody(OutgoingMessage::Request(msg), client_body)
-                    })
-
-            })
-            .and_then(|msg| msg);
+        let transfer = self.resolve_addr(msg.dst_addr)
+            .map(move |ip| {
+                let addr = SocketAddr::new(ip, port);
+                let tcp =
+                    TcpStream::connect(&addr, &core.borrow().handle()).map(move |conn| {
+                                                                               debug!("Connected!");
+                                                                               conn
+                                                                           });
+                let rep = match core.borrow_mut().run(tcp) {
+                    Ok(conn) => {
+                        remote_tx.send(conn).expect("mpsc send error");
+                        0x00
+                    }
+                    Err(_) => 0x01,
+                };
+                let msg = OutgoingRequestMessage {
+                    ver: SocksVersion::V5,
+                    rep: rep,
+                    bnd_addr: AddressType::Ip(ip),
+                    port: port,
+                };
+                debug!("{:?}", msg);
+                Message::WithoutBody(OutgoingMessage::Request(msg))
+            });
         Box::new(transfer)
+    }
+
+    fn serve_transfer(&self, body: Body<Vec<u8>, io::Error>) -> <Self as Service>::Future {
+        let (sender, client_body) = Body::<Vec<u8>, io::Error>::pair();
+        let framed = match self.remote_rx.recv() {
+            Ok(conn) => conn.framed(RedirectCodec),
+            Err(_) => {
+                return future::err(io::Error::new(io::ErrorKind::Other, "Connection missing"))
+                           .boxed()
+            }
+        };
+        let (sink, stream) = framed.split();
+        debug!("Transfer! Body: {:?}", body);
+        let from_client = sink.send_all(body);
+        let to_client = sender
+            .sink_map_err(|e| io::Error::new(io::ErrorKind::Other, "Sender error"))
+            .send_all(stream);
+        from_client.join(to_client);
+        debug!("Joined!");
+        future::ok(Message::WithBody(OutgoingMessage::Transfer, client_body)).boxed()
     }
 
     fn resolve_addr(&self, addr: AddressType) -> Box<Future<Item = IpAddr, Error = io::Error>> {
