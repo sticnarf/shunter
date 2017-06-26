@@ -1,5 +1,5 @@
 [package]
-name = "splitter"
+name = "shunter"
 version = "0.1.0"
 authors = ["Yilin Chen <sticnarf@gmail.com>"]
 
