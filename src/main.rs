@@ -1,5 +1,6 @@
 extern crate futures;
 extern crate tokio_core;
+#[macro_use]
 extern crate tokio_io;
 #[macro_use]
 extern crate log;
@@ -8,14 +9,17 @@ extern crate num;
 #[macro_use]
 extern crate num_derive;
 
-use futures::{Stream, Future, BoxFuture, Async, future};
-use tokio_core::reactor::{Core, Handle};
+use futures::{Poll, Stream, Future, BoxFuture, Async, future};
+use tokio_core::reactor::{Core, Handle, Timeout};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_io::io::{read_exact, write_all};
-use tokio_io::AsyncRead;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::{self, FromStr};
+use std::borrow::BorrowMut;
+use std::time::Duration;
+use std::net::Shutdown;
 use std::io::{self, Read, Write, ErrorKind};
+use std::rc::Rc;
 use num::FromPrimitive;
 
 fn main() {
@@ -91,7 +95,6 @@ fn serve(socket: TcpStream, peer_address: SocketAddr, handle: Handle) -> Box<Fut
             }))
         }
     });
-
     let reply = req.and_then(move |(socket, socket_addr)| {
         TcpStream::connect(&socket_addr, &handle).then(move |res| {
             info!("Connecting {}", socket_addr);
@@ -124,15 +127,64 @@ fn serve(socket: TcpStream, peer_address: SocketAddr, handle: Handle) -> Box<Fut
 
     let passing = reply.and_then(|(socket, conn)| {
         info!("Ready for passing!");
-        Ok(())
+        let socket = Rc::new(socket);
+        let conn = Rc::new(conn);
+        let client_to_server = Transfer {
+            reader: socket.clone(),
+            writer: conn.clone(),
+            bytes_count: 0
+        };
+        let server_to_client = Transfer {
+            reader: conn,
+            writer: socket,
+            bytes_count: 0
+        };
+
+        client_to_server.join(server_to_client)
     });
 
     non_send_box(passing.then(move |res| {
-        if let Err(e) = res {
-            info!("Error with client {}: {}", peer_address, e);
+        match res {
+            Ok((outbound, inbound)) => {
+                info!("Outbound: {} bytes, inbound: {} bytes", outbound, inbound);
+            },
+            Err(e) => {
+                info!("Error with client {}: {}", peer_address, e);
+            }
         }
         Ok(())
     }))
+}
+
+struct Transfer {
+    reader: Rc<TcpStream>,
+    writer: Rc<TcpStream>,
+    bytes_count: usize
+}
+
+impl Future for Transfer {
+    type Item = usize;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<usize, io::Error> {
+        loop {
+            let read_ready = self.reader.poll_read().is_ready();
+            let write_ready = self.writer.poll_write().is_ready();
+            if !(read_ready && write_ready) {
+                return Ok(Async::NotReady);
+            }
+
+            let mut buf: [u8; 4096] = [0; 4096];
+            let count = try_nb!((&*self.reader).read(&mut buf));
+            if count == 0 {
+                self.writer.shutdown(Shutdown::Write)?;
+                return Ok(Async::Ready(self.bytes_count));
+            }
+            self.bytes_count += count;
+
+            (&*self.writer).write(&buf[..count])?;
+        }
+    }
 }
 
 fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item=F::Item, Error=F::Error>> {
