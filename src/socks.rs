@@ -2,8 +2,9 @@ use futures::{Poll, Future, Async};
 use tokio_core::reactor::Handle;
 use tokio_core::net::TcpStream;
 use tokio_io::io::{read_exact, write_all};
+use tokio_dns::{CpuPoolResolver, Resolver};
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
-use std::str::{self, FromStr};
+use std::str;
 use std::net::Shutdown;
 use std::io::{self, Read, Write, ErrorKind};
 use std::rc::Rc;
@@ -13,6 +14,7 @@ pub fn serve(
     socket: TcpStream,
     peer_address: SocketAddr,
     handle: Handle,
+    resolver: CpuPoolResolver,
 ) -> Box<Future<Item = (), Error = io::Error>> {
     let auth = read_exact(socket, [0u8; 2])
         .and_then(|(socket, buf)| {
@@ -61,41 +63,67 @@ pub fn serve(
                 return Err(io::Error::new(ErrorKind::Other, "Unexpected reserved code"));
             }
             match FromPrimitive::from_u8(buf[3]) {
-                Some(aytp) => Ok((socket, aytp)),
+                Some(aytp) => {
+                    info!("AYTP: {:?}", aytp);
+                    Ok((socket, aytp))},
                 None => Err(io::Error::new(ErrorKind::Other, "Unknown AYTP")),
             }
         })
-    }).and_then(|(socket, aytp)| {
-            match aytp {
-                AYTP::IPv4 => non_send_box(read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
-                    let ip = IpAddr::from(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
-                    let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
-                    (socket, SocketAddr::new(ip, port))
-                })),
-                AYTP::IPv6 => non_send_box(read_exact(socket, [0u8; 18]).map(|(socket, buf)| {
-                    let ip = IpAddr::from(Ipv6Addr::new(
-                        (buf[0] as u16) << 8 | (buf[1] as u16),
-                        (buf[2] as u16) << 8 | (buf[3] as u16),
-                        (buf[4] as u16) << 8 | (buf[5] as u16),
-                        (buf[6] as u16) << 8 | (buf[7] as u16),
-                        (buf[8] as u16) << 8 | (buf[9] as u16),
-                        (buf[10] as u16) << 8 | (buf[11] as u16),
-                        (buf[12] as u16) << 8 | (buf[13] as u16),
-                        (buf[14] as u16) << 8 | (buf[15] as u16),
-                    ));
-                    let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
-                    (socket, SocketAddr::new(ip, port))
-                })),
-                AYTP::DomainName => non_send_box(
-                    read_exact(socket, [0u8]).and_then(|(socket, buf)| {
-                        read_exact(socket, vec![0u8; (buf[0] as usize) + 2])
-                            .and_then(|(socket, _)| {
-                                // TODO: Resolve IP from DNS server
-                                Ok((socket, SocketAddr::from_str("127.0.0.1:80").unwrap()))
-                            })
+    }).and_then(move |(socket, aytp)| match aytp {
+            AYTP::IPv4 => non_send_box(read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
+                let ip = IpAddr::from(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
+                let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
+                (socket, SocketAddr::new(ip, port))
+            })),
+            AYTP::IPv6 => non_send_box(read_exact(socket, [0u8; 18]).map(|(socket, buf)| {
+                let ip = IpAddr::from(Ipv6Addr::new(
+                    ((buf[0] as u16) << 8) | (buf[1] as u16),
+                    ((buf[2] as u16) << 8) | (buf[3] as u16),
+                    ((buf[4] as u16) << 8) | (buf[5] as u16),
+                    ((buf[6] as u16) << 8) | (buf[7] as u16),
+                    ((buf[8] as u16) << 8) | (buf[9] as u16),
+                    ((buf[10] as u16) << 8) | (buf[11] as u16),
+                    ((buf[12] as u16) << 8) | (buf[13] as u16),
+                    ((buf[14] as u16) << 8) | (buf[15] as u16),
+                ));
+                let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
+                (socket, SocketAddr::new(ip, port))
+            })),
+            AYTP::DomainName => non_send_box(
+                read_exact(socket, [0u8])
+                    .and_then(|(socket, buf)| {
+                        let domain_len = buf[0] as usize;
+                        read_exact(socket, vec![0u8; domain_len + 2]).and_then(
+                            move |(socket, buf)| {
+                                let domain = match str::from_utf8(&buf[..domain_len]) {
+                                    Ok(domain) => domain,
+                                    Err(_) => {
+                                        return Err(io::Error::new(
+                                            ErrorKind::Other,
+                                            "Invalid domain name",
+                                        ))
+                                    }
+                                };
+                                let port = ((buf[domain_len] as u16) << 8) +
+                                    buf[domain_len + 1] as u16;
+                                Ok((socket, String::from(domain), port))
+                            },
+                        )
+                    })
+                    .and_then(move |(socket, domain, port)| {
+                        info!("Resolving {}", &domain);
+                        resolver.resolve(&domain).and_then(
+                            move |mut addrs| match addrs
+                                .pop() {
+                                Some(addr) => Ok((socket, SocketAddr::new(addr, port))),
+                                None => Err(io::Error::new(
+                                    ErrorKind::Other,
+                                    "Cannot resolve domain name",
+                                )),
+                            },
+                        )
                     }),
-                ),
-            }
+            ),
         });
     let reply = req.and_then(move |(socket, socket_addr)| {
         TcpStream::connect(&socket_addr, &handle).then(move |res| {
@@ -226,9 +254,8 @@ impl Future for Transfer {
 
             let write_n = (&*self.writer).write(&self.buf[..read_n])?;
             if read_n != write_n {
-                return Err(io::Error::new(ErrorKind::Other, ""));
+                return Err(io::Error::new(ErrorKind::Other, "Bad write"));
             }
-            assert_eq!(read_n, write_n);
         }
     }
 }
@@ -238,11 +265,11 @@ fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error =
 }
 
 #[repr(u8)]
-#[derive(FromPrimitive)]
+#[derive(FromPrimitive, Debug, Clone, Copy)]
 enum AYTP {
     IPv4 = 0x01,
-    IPv6 = 0x03,
-    DomainName = 0x04,
+    IPv6 = 0x04,
+    DomainName = 0x03,
 }
 
 const SOCKS5_VERSION: u8 = 0x05;
