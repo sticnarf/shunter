@@ -19,6 +19,7 @@ use std::str;
 use clap::{Arg, App};
 
 mod socks;
+mod redirect;
 
 fn main() {
     let matches = App::new("shunter")

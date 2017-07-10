@@ -9,6 +9,7 @@ use std::net::Shutdown;
 use std::io::{self, Read, Write, ErrorKind};
 use std::rc::Rc;
 use num::FromPrimitive;
+use redirect::{self, Target};
 
 pub fn serve(
     socket: TcpStream,
@@ -126,7 +127,9 @@ pub fn serve(
             ),
         });
     let reply = req.and_then(move |(socket, socket_addr)| {
-        TcpStream::connect(&socket_addr, &handle).then(move |res| {
+        let target = redirect::Direct::new(socket_addr);
+        let connection = target.connect(handle.clone());
+        connection.then(move |res| {
             info!("Connecting {}", socket_addr);
             let mut reply_data = vec![SOCKS5_VERSION, SUCCEEDED_REPLY, RESERVED_CODE];
             match socket_addr {
