@@ -9,7 +9,8 @@ use std::net::Shutdown;
 use std::io::{self, Read, Write, ErrorKind};
 use std::rc::Rc;
 use num::FromPrimitive;
-use redirect::{self, Target};
+use redirect::{self, Proxy};
+use constants::socks::*;
 
 pub fn serve(
     socket: TcpStream,
@@ -42,7 +43,7 @@ pub fn serve(
                         write_all(socket, [SOCKS5_VERSION, NO_ACCEPTABLE_METHODS]).and_then(|_| {
                             Err(io::Error::new(
                                 ErrorKind::Other,
-                                "Unsupported SOCKS version",
+                                "No acceptable authentication methods",
                             ))
                         }),
                     )
@@ -61,12 +62,16 @@ pub fn serve(
                 return Err(io::Error::new(ErrorKind::Other, "Unsupported command"));
             }
             if buf[2] != RESERVED_CODE {
-                return Err(io::Error::new(ErrorKind::Other, "Unexpected reserved code"));
+                return Err(io::Error::new(
+                    ErrorKind::Other,
+                    format!("Expect reserved code, but {}", buf[2]),
+                ));
             }
             match FromPrimitive::from_u8(buf[3]) {
                 Some(aytp) => {
                     info!("AYTP: {:?}", aytp);
-                    Ok((socket, aytp))},
+                    Ok((socket, aytp))
+                }
                 None => Err(io::Error::new(ErrorKind::Other, "Unknown AYTP")),
             }
         })
@@ -128,6 +133,7 @@ pub fn serve(
         });
     let reply = req.and_then(move |(socket, socket_addr)| {
         let target = redirect::Direct::new(socket_addr);
+        // let target = redirect::Socks5::new("127.0.0.1:1086".parse().unwrap(), socket_addr);
         let connection = target.connect(handle.clone());
         connection.then(move |res| {
             info!("Connecting {}", socket_addr);
@@ -266,23 +272,3 @@ impl Future for Transfer {
 fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
     Box::new(f)
 }
-
-#[repr(u8)]
-#[derive(FromPrimitive, Debug, Clone, Copy)]
-enum AYTP {
-    IPv4 = 0x01,
-    IPv6 = 0x04,
-    DomainName = 0x03,
-}
-
-const SOCKS5_VERSION: u8 = 0x05;
-
-const NO_AUTHENTICATION_REQUIRED: u8 = 0x00;
-const NO_ACCEPTABLE_METHODS: u8 = 0xFF;
-
-const CONNECT_CMD: u8 = 0x01;
-
-const RESERVED_CODE: u8 = 0x00;
-
-const SUCCEEDED_REPLY: u8 = 0x00;
-const GENERAL_SOCKS_SERVER_FAILURE_REPLY: u8 = 0x01;

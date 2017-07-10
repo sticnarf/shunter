@@ -6,7 +6,10 @@ use std::io;
 mod direct;
 pub use self::direct::Direct;
 
-pub trait Target {
+mod socks5;
+pub use self::socks5::Socks5;
+
+pub trait Proxy {
     fn connect(&self, handle: Handle)
         -> Box<Future<Item = TcpStream, Error = io::Error> + 'static>;
 }

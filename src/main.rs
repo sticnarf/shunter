@@ -20,6 +20,7 @@ use clap::{Arg, App};
 
 mod socks;
 mod redirect;
+mod constants;
 
 fn main() {
     let matches = App::new("shunter")
