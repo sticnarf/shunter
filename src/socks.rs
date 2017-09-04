@@ -17,7 +17,7 @@ pub fn serve(
     peer_address: SocketAddr,
     handle: Handle,
     resolver: CpuPoolResolver,
-) -> Box<Future<Item = (), Error = io::Error>> {
+) -> Box<Future<Item=(), Error=io::Error>> {
     let auth = read_exact(socket, [0u8; 2])
         .and_then(|(socket, buf)| {
             if buf[0] != SOCKS5_VERSION {
@@ -33,12 +33,12 @@ pub fn serve(
                 .and_then(|(socket, buf)| if buf.iter().any(|&x| {
                     x == NO_AUTHENTICATION_REQUIRED
                 })
-                {
-                    non_send_box(
-                        write_all(socket, [SOCKS5_VERSION, NO_AUTHENTICATION_REQUIRED])
-                            .map(|(socket, _)| socket),
-                    )
-                } else {
+                    {
+                        non_send_box(
+                            write_all(socket, [SOCKS5_VERSION, NO_AUTHENTICATION_REQUIRED])
+                                .map(|(socket, _)| socket),
+                        )
+                    } else {
                     non_send_box(
                         write_all(socket, [SOCKS5_VERSION, NO_ACCEPTABLE_METHODS]).and_then(|_| {
                             Err(io::Error::new(
@@ -76,61 +76,61 @@ pub fn serve(
             }
         })
     }).and_then(move |(socket, aytp)| match aytp {
-            AYTP::IPv4 => non_send_box(read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
-                let ip = IpAddr::from(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
-                let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
-                (socket, SocketAddr::new(ip, port))
-            })),
-            AYTP::IPv6 => non_send_box(read_exact(socket, [0u8; 18]).map(|(socket, buf)| {
-                let ip = IpAddr::from(Ipv6Addr::new(
-                    ((buf[0] as u16) << 8) | (buf[1] as u16),
-                    ((buf[2] as u16) << 8) | (buf[3] as u16),
-                    ((buf[4] as u16) << 8) | (buf[5] as u16),
-                    ((buf[6] as u16) << 8) | (buf[7] as u16),
-                    ((buf[8] as u16) << 8) | (buf[9] as u16),
-                    ((buf[10] as u16) << 8) | (buf[11] as u16),
-                    ((buf[12] as u16) << 8) | (buf[13] as u16),
-                    ((buf[14] as u16) << 8) | (buf[15] as u16),
-                ));
-                let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
-                (socket, SocketAddr::new(ip, port))
-            })),
-            AYTP::DomainName => non_send_box(
-                read_exact(socket, [0u8])
-                    .and_then(|(socket, buf)| {
-                        let domain_len = buf[0] as usize;
-                        read_exact(socket, vec![0u8; domain_len + 2]).and_then(
-                            move |(socket, buf)| {
-                                let domain = match str::from_utf8(&buf[..domain_len]) {
-                                    Ok(domain) => domain,
-                                    Err(_) => {
-                                        return Err(io::Error::new(
-                                            ErrorKind::Other,
-                                            "Invalid domain name",
-                                        ))
-                                    }
-                                };
-                                let port = ((buf[domain_len] as u16) << 8) +
-                                    buf[domain_len + 1] as u16;
-                                Ok((socket, String::from(domain), port))
-                            },
-                        )
-                    })
-                    .and_then(move |(socket, domain, port)| {
-                        info!("Resolving {}", &domain);
-                        resolver.resolve(&domain).and_then(
-                            move |mut addrs| match addrs
-                                .pop() {
-                                Some(addr) => Ok((socket, SocketAddr::new(addr, port))),
-                                None => Err(io::Error::new(
-                                    ErrorKind::Other,
-                                    "Cannot resolve domain name",
-                                )),
-                            },
-                        )
-                    }),
-            ),
-        });
+        AYTP::IPv4 => non_send_box(read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
+            let ip = IpAddr::from(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
+            let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
+            (socket, SocketAddr::new(ip, port))
+        })),
+        AYTP::IPv6 => non_send_box(read_exact(socket, [0u8; 18]).map(|(socket, buf)| {
+            let ip = IpAddr::from(Ipv6Addr::new(
+                ((buf[0] as u16) << 8) | (buf[1] as u16),
+                ((buf[2] as u16) << 8) | (buf[3] as u16),
+                ((buf[4] as u16) << 8) | (buf[5] as u16),
+                ((buf[6] as u16) << 8) | (buf[7] as u16),
+                ((buf[8] as u16) << 8) | (buf[9] as u16),
+                ((buf[10] as u16) << 8) | (buf[11] as u16),
+                ((buf[12] as u16) << 8) | (buf[13] as u16),
+                ((buf[14] as u16) << 8) | (buf[15] as u16),
+            ));
+            let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
+            (socket, SocketAddr::new(ip, port))
+        })),
+        AYTP::DomainName => non_send_box(
+            read_exact(socket, [0u8])
+                .and_then(|(socket, buf)| {
+                    let domain_len = buf[0] as usize;
+                    read_exact(socket, vec![0u8; domain_len + 2]).and_then(
+                        move |(socket, buf)| {
+                            let domain = match str::from_utf8(&buf[..domain_len]) {
+                                Ok(domain) => domain,
+                                Err(_) => {
+                                    return Err(io::Error::new(
+                                        ErrorKind::Other,
+                                        "Invalid domain name",
+                                    ));
+                                }
+                            };
+                            let port = ((buf[domain_len] as u16) << 8) +
+                                buf[domain_len + 1] as u16;
+                            Ok((socket, String::from(domain), port))
+                        },
+                    )
+                })
+                .and_then(move |(socket, domain, port)| {
+                    info!("Resolving {}", &domain);
+                    resolver.resolve(&domain).and_then(
+                        move |mut addrs| match addrs
+                            .pop() {
+                            Some(addr) => Ok((socket, SocketAddr::new(addr, port))),
+                            None => Err(io::Error::new(
+                                ErrorKind::Other,
+                                "Cannot resolve domain name",
+                            )),
+                        },
+                    )
+                }),
+        ),
+    });
     let reply = req.and_then(move |(socket, socket_addr)| {
         let target = redirect::Direct::new(socket_addr);
         // let target = redirect::Socks5::new("127.0.0.1:1086".parse().unwrap(), socket_addr);
@@ -269,6 +269,6 @@ impl Future for Transfer {
     }
 }
 
-fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
+fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item=F::Item, Error=F::Error>> {
     Box::new(f)
 }

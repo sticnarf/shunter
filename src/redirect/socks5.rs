@@ -26,7 +26,7 @@ impl Proxy for Socks5 {
     fn connect(
         &self,
         handle: Handle,
-    ) -> Box<Future<Item = TcpStream, Error = io::Error> + 'static> {
+    ) -> Box<Future<Item=TcpStream, Error=io::Error> + 'static> {
         let connect = TcpStream::connect(&self.proxy_addr, &handle).and_then(|conn| {
             write_all(conn, [SOCKS5_VERSION, 1, NO_AUTHENTICATION_REQUIRED]).map(|(conn, _)| conn)
         });

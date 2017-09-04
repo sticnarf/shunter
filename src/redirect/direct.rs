@@ -19,7 +19,7 @@ impl Proxy for Direct {
     fn connect(
         &self,
         handle: Handle,
-    ) -> Box<Future<Item = TcpStream, Error = io::Error> + 'static> {
+    ) -> Box<Future<Item=TcpStream, Error=io::Error> + 'static> {
         TcpStream::connect(&self.addr, &handle).boxed()
     }
 }
