@@ -1,17 +1,16 @@
 [package]
-name = "splitter"
+name = "shunter"
 version = "0.1.0"
 authors = ["Yilin Chen <sticnarf@gmail.com>"]
 
 [dependencies]
 futures = "0.1"
-tokio-io = "0.1"
 tokio-core = "0.1"
-tokio-proto = "0.1"
-tokio-service = "0.1"
-bytes = "0.4"
+tokio-io = "0.1"
+log = "0.3"
+env_logger = "0.4"
 num = "0.1"
 num-derive = "0.1"
-trust-dns = "0.10"
-log = "0.3"
-env_logger = "0.3"
+clap = "2.25"
+tokio-dns-unofficial = "0.1"
+toml = "0.4"
