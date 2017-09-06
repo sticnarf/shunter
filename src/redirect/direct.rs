@@ -4,6 +4,7 @@ use tokio_core::reactor::Handle;
 use tokio_core::net::TcpStream;
 use std::io;
 use std::net::SocketAddr;
+use FutureExt;
 
 pub struct Direct {
     addr: SocketAddr,
@@ -19,7 +20,7 @@ impl Proxy for Direct {
     fn connect(
         &self,
         handle: Handle,
-    ) -> Box<Future<Item=TcpStream, Error=io::Error> + 'static> {
-        TcpStream::connect(&self.addr, &handle).boxed()
+    ) -> Box<Future<Item = TcpStream, Error = io::Error> + 'static> {
+        TcpStream::connect(&self.addr, &handle).into_box()
     }
 }

@@ -7,6 +7,7 @@ use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use num::FromPrimitive;
 use constants::socks::*;
+use FutureExt;
 
 pub struct Socks5 {
     proxy_addr: SocketAddr,
@@ -95,12 +96,12 @@ impl Proxy for Socks5 {
                     AYTP::IPv4 => {
                         read_exact(conn, [0u8; 6])
                             .and_then(|(conn, _)| Ok(conn))
-                            .boxed()
+                            .into_box()
                     }
                     AYTP::IPv6 => {
                         read_exact(conn, [0u8; 18])
                             .and_then(|(conn, _)| Ok(conn))
-                            .boxed()
+                            .into_box()
                     }
                     AYTP::DomainName => {
                         read_exact(conn, [0u8])
@@ -110,11 +111,11 @@ impl Proxy for Socks5 {
                                     |(conn, _)| conn,
                                 )
                             })
-                            .boxed()
+                            .into_box()
                     }
                 })
         });
 
-        ack.boxed()
+        ack.into_box()
     }
 }

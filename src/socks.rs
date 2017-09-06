@@ -11,6 +11,7 @@ use std::rc::Rc;
 use num::FromPrimitive;
 use redirect::{self, Proxy};
 use constants::socks::*;
+use FutureExt;
 
 pub fn serve(
     socket: TcpStream,
@@ -18,37 +19,31 @@ pub fn serve(
     handle: Handle,
     resolver: CpuPoolResolver,
 ) -> Box<Future<Item=(), Error=io::Error>> {
-    let auth = read_exact(socket, [0u8; 2])
-        .and_then(|(socket, buf)| {
-            if buf[0] != SOCKS5_VERSION {
-                return Err(io::Error::new(
-                    ErrorKind::Other,
-                    "Unsupported SOCKS version",
-                ));
-            }
-            Ok((socket, buf[1]))
-        })
-        .and_then(|(socket, method_cnt)| {
-            read_exact(socket, vec![0u8; method_cnt as usize])
-                .and_then(|(socket, buf)| if buf.iter().any(|&x| {
-                    x == NO_AUTHENTICATION_REQUIRED
-                })
-                    {
-                        non_send_box(
-                            write_all(socket, [SOCKS5_VERSION, NO_AUTHENTICATION_REQUIRED])
-                                .map(|(socket, _)| socket),
-                        )
-                    } else {
-                    non_send_box(
-                        write_all(socket, [SOCKS5_VERSION, NO_ACCEPTABLE_METHODS]).and_then(|_| {
-                            Err(io::Error::new(
-                                ErrorKind::Other,
-                                "No acceptable authentication methods",
-                            ))
-                        }),
-                    )
-                })
-        });
+    // Read the SOCKS version and the number of methods the client supports
+    let auth = read_exact(socket, [0u8; 2]).and_then(|(socket, buf)| {
+        if buf[0] != SOCKS5_VERSION {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                "Unsupported SOCKS version",
+            ));
+        }
+        Ok((socket, buf[1]))
+    }).and_then(|(socket, method_cnt)|
+        // Read the acceptable methods
+        read_exact(socket, vec![0u8; method_cnt as usize]).and_then(|(socket, buf)|
+            // No authentication method is supported at this stage
+            if buf.iter().any(|&x| x == NO_AUTHENTICATION_REQUIRED) {
+                write_all(socket, [SOCKS5_VERSION, NO_AUTHENTICATION_REQUIRED])
+                    .map(|(socket, _)| socket).into_box()
+            } else {
+                write_all(socket, [SOCKS5_VERSION, NO_ACCEPTABLE_METHODS]).and_then(|_| {
+                    Err(io::Error::new(
+                        ErrorKind::Other,
+                        "No acceptable authentication methods",
+                    ))
+                }).into_box()
+            })
+    );
 
     let req = auth.and_then(|socket| {
         read_exact(socket, [0u8; 4]).and_then(|(socket, buf)| {
@@ -69,7 +64,7 @@ pub fn serve(
             }
             match FromPrimitive::from_u8(buf[3]) {
                 Some(aytp) => {
-                    info!("AYTP: {:?}", aytp);
+                    debug!("AYTP: {:?}", aytp);
                     Ok((socket, aytp))
                 }
                 None => Err(io::Error::new(ErrorKind::Other, "Unknown AYTP")),
@@ -272,3 +267,4 @@ impl Future for Transfer {
 fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item=F::Item, Error=F::Error>> {
     Box::new(f)
 }
+
