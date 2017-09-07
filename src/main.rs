@@ -110,11 +110,13 @@ fn clap() -> Config {
 fn init_logger(config: &Config) -> slog_scope::GlobalLoggerGuard {
     use slog::{Drain, Level};
 
-    let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-//    let decorator = slog_term::TermDecorator::new().build();
-//    let drain = slog_term::CompactFormat::new(decorator).build().fuse();
-//    let drain = slog_async::Async::new(drain).build().fuse();
+//    The following two lines are for sync logging.
+//    let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
+//    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = slog_term::CompactFormat::new(decorator).build().fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
 
     // Because slog will remove all debug logs on releases,
     // Level::Debug is set if the program is set to verbose mode.

@@ -149,8 +149,8 @@ pub fn serve(
 
     passing.then(move |res| {
         match res {
-            Ok((outbound, inbound)) => {
-                debug!("Outbound: {} bytes, inbound: {} bytes", outbound, inbound);
+            Ok((_, _)) => {
+                info!("Connection with client {} completed.", peer_address);
             }
             Err(e) => {
                 error!("Error with client {}: {}", peer_address, e);
@@ -166,7 +166,6 @@ struct Transfer {
     buf: Vec<u8>,
     read_n: usize,
     write_p: usize,
-    bytes_count: usize,
 }
 
 impl Transfer {
@@ -174,54 +173,48 @@ impl Transfer {
         Transfer {
             reader: reader,
             writer: writer,
-            buf: vec![0; 65536],
+            buf: vec![0; 4096],
             read_n: 0,
             write_p: 0,
-            bytes_count: 0,
         }
     }
 }
 
 impl Future for Transfer {
-    type Item = usize;
+    type Item = ();
     type Error = io::Error;
-    
-    fn poll(&mut self) -> Poll<usize, io::Error> {
+
+    fn poll(&mut self) -> Poll<(), io::Error> {
         loop {
-            while self.read_n > 0 {
-                let write_ready = self.writer.poll_write().is_ready();
-                if !write_ready {
-                    return Ok(Async::NotReady);
-                }
-
-                let write_n = try_nb!((&*self.writer).write(&self.buf[self.write_p..self.read_n]));
-                debug!("Write {} bytes", write_n);
-                self.write_p += write_n;
-
-                if self.write_p == self.read_n {
-                    self.read_n = 0;
-                }
-            }
-
             let read_ready = self.reader.poll_read().is_ready();
             let write_ready = self.writer.poll_write().is_ready();
-            if !(read_ready && write_ready) {
+
+            // Writer must be ready.
+            // And either there are some bytes in the buffer not sent yet or reader is ready.
+            if !write_ready || (self.read_n == 0 && !read_ready) {
                 return Ok(Async::NotReady);
             }
 
-            self.read_n = try_nb!((&*self.reader).read(&mut self.buf[..]));
+            // There are no data in the buffer. Must read from reader.
             if self.read_n == 0 {
-                self.writer.shutdown(Shutdown::Write)?;
-                return Ok(Async::Ready(self.bytes_count));
+                self.read_n = try_nb!((&*self.reader).read(&mut self.buf[..]));
+
+                // self.read_n == 0 indicates EOF
+                if self.read_n == 0 {
+                    self.writer.shutdown(Shutdown::Write)?;
+                    return Ok(Async::Ready(()));
+                }
+
+                // Read successfully. Reset write pointer.
+                self.write_p = 0;
+                debug!("Read {} bytes", self.read_n);
             }
-            self.bytes_count += self.read_n;
-            self.write_p = 0;
-            debug!("Read {} bytes", self.read_n);
 
             let write_n = try_nb!((&*self.writer).write(&self.buf[self.write_p..self.read_n]));
-            debug!("Write {} bytes", write_n);
             self.write_p += write_n;
+            debug!("Write {} bytes", write_n);
 
+            // Have written all bytes in the buffer, clear read_n
             if self.write_p == self.read_n {
                 self.read_n = 0;
             }
