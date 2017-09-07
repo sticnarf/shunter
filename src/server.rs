@@ -11,7 +11,7 @@ use std::rc::Rc;
 use num::FromPrimitive;
 use redirect::{self, Proxy};
 use constants::socks::*;
-use FutureExt;
+use socks_helpers::FutureExt;
 
 pub fn serve(
     socket: TcpStream,
@@ -21,62 +21,46 @@ pub fn serve(
 ) -> Box<Future<Item=(), Error=io::Error>> {
     // Read the SOCKS version and the number of methods the client supports
     let auth = read_exact(socket, [0u8; 2]).and_then(|(socket, buf)| {
-        if buf[0] != SOCKS5_VERSION {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                "Unsupported SOCKS version",
-            ));
-        }
+        check_socks_version!(buf[0]);
         Ok((socket, buf[1]))
     }).and_then(|(socket, method_cnt)|
         // Read the acceptable methods
         read_exact(socket, vec![0u8; method_cnt as usize]).and_then(|(socket, buf)|
             // No authentication method is supported at this stage
             if buf.iter().any(|&x| x == NO_AUTHENTICATION_REQUIRED) {
+                // Tell the client that we do not use authentication
                 write_all(socket, [SOCKS5_VERSION, NO_AUTHENTICATION_REQUIRED])
                     .map(|(socket, _)| socket).into_box()
             } else {
-                write_all(socket, [SOCKS5_VERSION, NO_ACCEPTABLE_METHODS]).and_then(|_| {
-                    Err(io::Error::new(
-                        ErrorKind::Other,
-                        "No acceptable authentication methods",
-                    ))
-                }).into_box()
+                write_all(socket, [SOCKS5_VERSION, NO_ACCEPTABLE_METHODS])
+                    .and_then(|_| tokio_err!("No acceptable authentication methods")).into_box()
             })
     );
 
     let req = auth.and_then(|socket| {
         read_exact(socket, [0u8; 4]).and_then(|(socket, buf)| {
-            if buf[0] != SOCKS5_VERSION {
-                return Err(io::Error::new(
-                    ErrorKind::Other,
-                    "Unsupported SOCKS version",
-                ));
-            }
+            check_socks_version!(buf[0]);
             if buf[1] != CONNECT_CMD {
-                return Err(io::Error::new(ErrorKind::Other, "Unsupported command"));
+                return tokio_err!("Unsupported command");
             }
             if buf[2] != RESERVED_CODE {
-                return Err(io::Error::new(
-                    ErrorKind::Other,
-                    format!("Expect reserved code, but {}", buf[2]),
-                ));
+                return tokio_err!(format!("Expect reserved code, but {}", buf[2]));
             }
             match FromPrimitive::from_u8(buf[3]) {
                 Some(aytp) => {
                     debug!("AYTP: {:?}", aytp);
                     Ok((socket, aytp))
                 }
-                None => Err(io::Error::new(ErrorKind::Other, "Unknown AYTP")),
+                None => tokio_err!("Unknown AYTP"),
             }
         })
     }).and_then(move |(socket, aytp)| match aytp {
-        AYTP::IPv4 => non_send_box(read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
+        AYTP::IPv4 => read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
             let ip = IpAddr::from(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
             let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
             (socket, SocketAddr::new(ip, port))
-        })),
-        AYTP::IPv6 => non_send_box(read_exact(socket, [0u8; 18]).map(|(socket, buf)| {
+        }).into_box(),
+        AYTP::IPv6 => read_exact(socket, [0u8; 18]).map(|(socket, buf)| {
             let ip = IpAddr::from(Ipv6Addr::new(
                 ((buf[0] as u16) << 8) | (buf[1] as u16),
                 ((buf[2] as u16) << 8) | (buf[3] as u16),
@@ -89,8 +73,8 @@ pub fn serve(
             ));
             let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
             (socket, SocketAddr::new(ip, port))
-        })),
-        AYTP::DomainName => non_send_box(
+        }).into_box(),
+        AYTP::DomainName =>
             read_exact(socket, [0u8])
                 .and_then(|(socket, buf)| {
                     let domain_len = buf[0] as usize;
@@ -98,12 +82,7 @@ pub fn serve(
                         move |(socket, buf)| {
                             let domain = match str::from_utf8(&buf[..domain_len]) {
                                 Ok(domain) => domain,
-                                Err(_) => {
-                                    return Err(io::Error::new(
-                                        ErrorKind::Other,
-                                        "Invalid domain name",
-                                    ));
-                                }
+                                Err(_) => return tokio_err!("Invalid domain name")
                             };
                             let port = ((buf[domain_len] as u16) << 8) +
                                 buf[domain_len + 1] as u16;
@@ -114,17 +93,12 @@ pub fn serve(
                 .and_then(move |(socket, domain, port)| {
                     info!("Resolving {}", &domain);
                     resolver.resolve(&domain).and_then(
-                        move |mut addrs| match addrs
-                            .pop() {
+                        move |mut addrs| match addrs.pop() {
                             Some(addr) => Ok((socket, SocketAddr::new(addr, port))),
-                            None => Err(io::Error::new(
-                                ErrorKind::Other,
-                                "Cannot resolve domain name",
-                            )),
-                        },
+                            None => tokio_err!("Cannot resolve domain name"),
+                        }
                     )
-                }),
-        ),
+                }).into_box(),
     });
     let reply = req.and_then(move |(socket, socket_addr)| {
         let target = redirect::Direct::new(socket_addr);
@@ -179,16 +153,15 @@ pub fn serve(
             };
             match res {
                 Ok(conn) => {
-                    non_send_box(write_all(socket, reply_data).and_then(|(socket, _)| {
+                    write_all(socket, reply_data).and_then(|(socket, _)| {
                         Ok((socket, conn))
-                    }))
+                    }).into_box()
                 }
                 Err(e) => {
                     info!("Error on connecting to remote server: {}", e);
                     reply_data[1] = GENERAL_SOCKS_SERVER_FAILURE_REPLY;
-                    non_send_box(write_all(socket, reply_data).and_then(|_| {
-                        Err(io::Error::new(ErrorKind::Other, "Connection failure"))
-                    }))
+                    write_all(socket, reply_data)
+                        .and_then(|_| tokio_err!("Connection failure")).into_box()
                 }
             }
         })
@@ -205,7 +178,7 @@ pub fn serve(
         client_to_server.join(server_to_client)
     });
 
-    non_send_box(passing.then(move |res| {
+    passing.then(move |res| {
         match res {
             Ok((outbound, inbound)) => {
                 info!("Outbound: {} bytes, inbound: {} bytes", outbound, inbound);
@@ -215,7 +188,7 @@ pub fn serve(
             }
         }
         Ok(())
-    }))
+    }).into_box()
 }
 
 struct Transfer {
@@ -258,13 +231,8 @@ impl Future for Transfer {
 
             let write_n = (&*self.writer).write(&self.buf[..read_n])?;
             if read_n != write_n {
-                return Err(io::Error::new(ErrorKind::Other, "Bad write"));
+                return tokio_err!("Bad write");
             }
         }
     }
 }
-
-fn non_send_box<F: Future + 'static>(f: F) -> Box<Future<Item=F::Item, Error=F::Error>> {
-    Box::new(f)
-}
-

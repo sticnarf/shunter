@@ -22,7 +22,9 @@ use tokio_dns::CpuPoolResolver;
 use std::str;
 use clap::{Arg, App};
 
-mod socks;
+#[macro_use]
+mod socks_helpers;
+mod server;
 mod redirect;
 mod constants;
 
@@ -43,22 +45,12 @@ fn main() {
     let server = connections.for_each(|(socket, peer_addr)| {
         info!("Start listening to client: {}", peer_addr);
         handle.spawn(
-            socks::serve(socket, peer_addr, handle.clone(), resolver.clone())
+            server::serve(socket, peer_addr, handle.clone(), resolver.clone())
                 .then(|_| Ok(())),
         );
         Ok(())
     });
     core.run(server).ok();
-}
-
-trait FutureExt<F: Future> {
-    fn into_box(self) -> Box<Future<Item=F::Item, Error=F::Error>>;
-}
-
-impl<F: Future + 'static> FutureExt<F> for F {
-    fn into_box(self) -> Box<Future<Item=F::Item, Error=F::Error>> {
-        Box::new(self)
-    }
 }
 
 struct Config {

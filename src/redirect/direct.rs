@@ -4,7 +4,7 @@ use tokio_core::reactor::Handle;
 use tokio_core::net::TcpStream;
 use std::io;
 use std::net::SocketAddr;
-use FutureExt;
+use socks_helpers::FutureExt;
 
 pub struct Direct {
     addr: SocketAddr,

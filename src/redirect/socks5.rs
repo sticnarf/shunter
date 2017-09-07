@@ -7,7 +7,7 @@ use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use num::FromPrimitive;
 use constants::socks::*;
-use FutureExt;
+use socks_helpers::FutureExt;
 
 pub struct Socks5 {
     proxy_addr: SocketAddr,
@@ -34,17 +34,9 @@ impl Proxy for Socks5 {
 
         let auth_ok = connect.and_then(|conn| {
             read_exact(conn, [0u8; 2]).and_then(|(conn, buf)| {
-                if buf[0] != SOCKS5_VERSION {
-                    return Err(io::Error::new(
-                        ErrorKind::Other,
-                        "Unsupported SOCKS version",
-                    ));
-                }
+                check_socks_version!(buf[0]);
                 if buf[1] != NO_AUTHENTICATION_REQUIRED {
-                    return Err(io::Error::new(
-                        ErrorKind::Other,
-                        "No acceptable authentication methods",
-                    ));
+                    return tokio_err!("No acceptable authentication methods");
                 }
                 Ok(conn)
             })
@@ -73,23 +65,17 @@ impl Proxy for Socks5 {
             read_exact(conn, [0u8; 4])
                 .and_then(|(conn, buf)| {
                     if buf[0] != SOCKS5_VERSION {
-                        return Err(io::Error::new(
-                            ErrorKind::Other,
-                            "Unsupported SOCKS version",
-                        ));
+                        return tokio_err!("Unsupported SOCKS version");
                     }
                     if buf[1] != SUCCEEDED_REPLY {
-                        return Err(io::Error::new(ErrorKind::Other, "Request not succeeded"));
+                        return tokio_err!("Request not succeeded");
                     }
                     if buf[2] != RESERVED_CODE {
-                        return Err(io::Error::new(
-                            ErrorKind::Other,
-                            format!("Expect reserved code, but {}", buf[2]),
-                        ));
+                        return tokio_err!(format!("Expect reserved code, but {}", buf[2]));
                     }
                     match FromPrimitive::from_u8(buf[3]) {
                         Some(aytp) => Ok((conn, aytp)),
-                        None => Err(io::Error::new(ErrorKind::Other, "Unknown AYTP")),
+                        None => tokio_err!("Unknown AYTP"),
                     }
                 })
                 .and_then(|(conn, aytp)| match aytp {
