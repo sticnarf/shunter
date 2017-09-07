@@ -37,15 +37,20 @@ pub fn serve(
             })
     );
 
-    let req = auth.and_then(|socket| {
+    let req = auth.and_then(|socket|
         read_exact(socket, [0u8; 4]).and_then(|(socket, buf)| {
             check_socks_version!(buf[0]);
+
+            // TODO Only support CONNECT command at this stage
             if buf[1] != CONNECT_CMD {
                 return tokio_err!("Unsupported command");
             }
+
+            // RSV must be zero
             if buf[2] != RESERVED_CODE {
                 return tokio_err!(format!("Expect reserved code, but {}", buf[2]));
             }
+
             match FromPrimitive::from_u8(buf[3]) {
                 Some(aytp) => {
                     debug!("AYTP: {:?}", aytp);
@@ -54,7 +59,7 @@ pub fn serve(
                 None => tokio_err!("Unknown AYTP"),
             }
         })
-    }).and_then(move |(socket, aytp)| match aytp {
+    ).and_then(move |(socket, aytp)| match aytp {
         AYTP::IPv4 => read_exact(socket, [0u8; 6]).map(|(socket, buf)| {
             let ip = IpAddr::from(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
             let port = ((buf[4] as u16) << 8) | (buf[5] as u16);

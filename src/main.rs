@@ -55,6 +55,7 @@ fn main() {
 
 struct Config {
     addr: SocketAddr,
+    verbose: bool
 }
 
 /// Parse configs from the command line arguments.
@@ -83,6 +84,12 @@ fn clap() -> Config {
                 .help("Run shunter on the specific port")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("verbose")
+                .short("v")
+                .long("verbose")
+                .help("Enable verbose mode")
+        )
         .get_matches();
 
     // Panic the program if an invalid binding address is given
@@ -92,7 +99,8 @@ fn clap() -> Config {
         .expect("Invalid binding IP or port");
 
     Config {
-        addr: addr
+        addr: addr,
+        verbose: matches.is_present("verbose")
     }
 }
 
@@ -100,11 +108,14 @@ fn clap() -> Config {
 /// This function returns a `GlobalLoggerGuard` which should be well saved.
 /// After the `GlobalLoggerGuard` is dropped, the global logger will be unavailable.
 fn init_logger(config: &Config) -> slog_scope::GlobalLoggerGuard {
-    use slog::Drain;
+    use slog::{Drain, Level};
 
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::CompactFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
+
+    let least_level = if config.verbose { Level::Debug } else  { Level::Warning };
+    let drain = drain.filter_level(least_level).fuse();
 
     let log = slog::Logger::root(drain, o!());
     slog_scope::set_global_logger(log)
