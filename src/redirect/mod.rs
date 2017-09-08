@@ -7,9 +7,9 @@ mod direct;
 
 pub use self::direct::Direct;
 
-mod socks5;
+mod socks;
 
-pub use self::socks5::Socks5;
+pub use self::socks::Socks5;
 
 pub trait Proxy {
     fn connect(&self, handle: Handle)

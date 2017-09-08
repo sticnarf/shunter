@@ -15,7 +15,7 @@ extern crate slog_async;
 extern crate slog_scope;
 
 use std::net::SocketAddr;
-use futures::{future, Future, Stream};
+use futures::{Future, Stream};
 use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
 use tokio_dns::CpuPoolResolver;
@@ -23,10 +23,9 @@ use std::str;
 use clap::{Arg, App};
 
 #[macro_use]
-mod socks_helpers;
+mod socks;
 mod server;
 mod redirect;
-mod constants;
 
 fn main() {
     let config = clap();

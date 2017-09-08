@@ -4,7 +4,7 @@ use tokio_core::reactor::Handle;
 use tokio_core::net::TcpStream;
 use std::io;
 use std::net::SocketAddr;
-use socks_helpers::FutureExt;
+use socks::FutureExt;
 
 pub struct Direct {
     addr: SocketAddr,
@@ -12,7 +12,7 @@ pub struct Direct {
 
 impl Direct {
     pub fn new(addr: SocketAddr) -> Direct {
-        Direct { addr: addr }
+        Direct { addr }
     }
 }
 
