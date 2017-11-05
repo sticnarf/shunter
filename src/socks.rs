@@ -1,12 +1,18 @@
 use futures::Future;
-use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-pub trait FutureExt<F: Future> {
-    fn into_box(self) -> Box<Future<Item=F::Item, Error=F::Error>>;
+pub trait FutureExt<F>
+where
+    F: Future + 'static,
+{
+    fn into_box(self) -> Box<Future<Item = F::Item, Error = F::Error> + 'static>;
 }
 
-impl<F: Future + 'static> FutureExt<F> for F {
-    fn into_box(self) -> Box<Future<Item=F::Item, Error=F::Error>> {
+impl<F> FutureExt<F> for F
+where
+    F: Future + 'static,
+{
+    fn into_box(self) -> Box<Future<Item = F::Item, Error = F::Error> + 'static> {
         Box::new(self)
     }
 }

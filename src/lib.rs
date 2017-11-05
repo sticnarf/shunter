@@ -17,11 +17,11 @@ extern crate tokio_io;
 
 #[macro_use]
 mod socks;
-mod redirect;
+pub mod redirect;
 
 use std::net::SocketAddr;
 use std::str;
-use futures::{Async, Future, Poll, Stream};
+use futures::{future, Async, Future, Poll, Stream};
 use tokio_core::reactor::{Core, Handle};
 use tokio_core::net::{TcpListener, TcpStream};
 use tokio_io::io::{read_exact, write_all};
@@ -29,49 +29,57 @@ use tokio_dns::{CpuPoolResolver, Resolver};
 use std::net::Shutdown;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use num::FromPrimitive;
 use redirect::Proxy;
 use socks::*;
 
-pub struct Shunter<R, P>
+pub struct Shunter<R>
 where
-    R: FnOnce(SocketAddr, SocketAddr) -> P,
-    P: Proxy,
+    R: Router + 'static,
 {
     ev_loop: Core,
     listener: TcpListener,
-    rule: R,
+    phantom_router: PhantomData<R>,
 }
 
-impl<R, P> Shunter<R, P>
+impl<R> Shunter<R>
 where
-    R: FnOnce(SocketAddr, SocketAddr) -> P,
-    P: Proxy,
+    R: Router + 'static,
 {
-    pub fn create(bind_addr: SocketAddr, rule: R) -> io::Result<Shunter<R, P>> {
+    pub fn create(bind_addr: SocketAddr) -> io::Result<Shunter<R>> {
         let ev_loop = Core::new()?;
         let listener = TcpListener::bind(&bind_addr, &ev_loop.handle())?;
         Ok(Shunter {
             ev_loop,
             listener,
-            rule,
+            phantom_router: PhantomData,
         })
     }
 
-    pub fn start(mut self) {
+    pub fn start(self, router: R) {
         let connections = self.listener.incoming();
         let resolver = CpuPoolResolver::new(num_cpus::get());
         let handle = self.ev_loop.handle();
-        let rule = Box::new(self.rule);
-        let server = connections.for_each(|(socket, peer_addr)| {
-            info!("Start listening to client: {}", peer_addr);
-            handle.spawn(
-                Shunter::serve(socket, peer_addr, handle.clone(), resolver.clone(), rule)
-                    .then(|_| Ok(())),
-            );
-            Ok(())
-        });
-        self.ev_loop.run(server).ok();
+        let router = Rc::new(RefCell::new(router));
+        let mut ev_loop = self.ev_loop;
+        let server = connections
+            .for_each(move |(socket, peer_addr)| {
+                info!("Start listening to client: {}", peer_addr);
+                handle.spawn(
+                    Shunter::serve(
+                        socket,
+                        peer_addr,
+                        handle.clone(),
+                        resolver.clone(),
+                        router.clone(),
+                    ).then(|_| Ok(())),
+                );
+                Ok(())
+            })
+            .into_box();
+        ev_loop.run(server).ok();
     }
 
     fn serve(
@@ -79,8 +87,8 @@ where
         peer_address: SocketAddr,
         handle: Handle,
         resolver: CpuPoolResolver,
-        rule: R,
-    ) -> Box<Future<Item = (), Error = io::Error>> {
+        router: Rc<RefCell<R>>,
+    ) -> Box<Future<Item = (), Error = io::Error> + 'static> {
         // Read the SOCKS version and the number of methods the client supports
         let auth = read_exact(socket, [0u8; 2])
             .and_then(|(socket, buf)| {
@@ -158,67 +166,71 @@ where
             });
 
         let reply = req.and_then(move |(socket, target_addr)| {
-            // TODO switch redirecting method by rules
-            //        let target = redirect::Direct::new(target_addr);
-            let target = redirect::Socks5::new("127.0.0.1:1089".parse().unwrap(), target_addr);
-            let connection = target.connect(handle.clone());
-            connection.then(move |res| {
-                debug!("Connecting {}", target_addr);
-                let mut reply_data = vec![SOCKS5_VERSION, SUCCEEDED_REPLY, RESERVED_CODE];
-                match target_addr {
-                    SocketAddr::V4(addr) => {
-                        let ip = addr.ip().octets();
-                        let port = addr.port();
-                        reply_data.extend_from_slice(&[
-                            AYTP::IPv4 as u8,
-                            ip[0],
-                            ip[1],
-                            ip[2],
-                            ip[3],
-                            (port >> 8) as u8,
-                            port as u8,
-                        ]);
-                    }
-                    SocketAddr::V6(addr) => {
-                        let ip = addr.ip().octets();
-                        let port = addr.port();
-                        reply_data.extend_from_slice(&[
-                            AYTP::IPv6 as u8,
-                            ip[0],
-                            ip[1],
-                            ip[2],
-                            ip[3],
-                            ip[4],
-                            ip[5],
-                            ip[6],
-                            ip[7],
-                            ip[8],
-                            ip[9],
-                            ip[10],
-                            ip[11],
-                            ip[12],
-                            ip[13],
-                            ip[14],
-                            ip[15],
-                            (port >> 8) as u8,
-                            port as u8,
-                        ]);
-                    }
-                };
+            let client_addr = match socket.peer_addr() {
+                Ok(addr) => addr,
+                Err(e) => return future::err(e).into_box(),
+            };
+            let proxy = router.borrow().route(client_addr, target_addr);
+            let connection = proxy.connect(handle.clone());
+            connection
+                .then(move |res| {
+                    debug!("Connecting {}", target_addr);
+                    let mut reply_data = vec![SOCKS5_VERSION, SUCCEEDED_REPLY, RESERVED_CODE];
+                    match target_addr {
+                        SocketAddr::V4(addr) => {
+                            let ip = addr.ip().octets();
+                            let port = addr.port();
+                            reply_data.extend_from_slice(&[
+                                AYTP::IPv4 as u8,
+                                ip[0],
+                                ip[1],
+                                ip[2],
+                                ip[3],
+                                (port >> 8) as u8,
+                                port as u8,
+                            ]);
+                        }
+                        SocketAddr::V6(addr) => {
+                            let ip = addr.ip().octets();
+                            let port = addr.port();
+                            reply_data.extend_from_slice(&[
+                                AYTP::IPv6 as u8,
+                                ip[0],
+                                ip[1],
+                                ip[2],
+                                ip[3],
+                                ip[4],
+                                ip[5],
+                                ip[6],
+                                ip[7],
+                                ip[8],
+                                ip[9],
+                                ip[10],
+                                ip[11],
+                                ip[12],
+                                ip[13],
+                                ip[14],
+                                ip[15],
+                                (port >> 8) as u8,
+                                port as u8,
+                            ]);
+                        }
+                    };
 
-                match res {
-                    Ok(conn) => write_all(socket, reply_data)
-                        .map(|(socket, _)| (socket, conn))
-                        .into_box(),
-                    Err(e) => {
-                        debug!("Error on connecting to remote server: {}", e);
-                        reply_data[1] = GENERAL_SOCKS_SERVER_FAILURE_REPLY;
-                        write_all(socket, reply_data)
-                            .and_then(|_| tokio_err!("Connecting to target server failure"))
-                            .into_box()
+                    match res {
+                        Ok(conn) => write_all(socket, reply_data)
+                            .map(|(socket, _)| (socket, conn))
+                            .into_box(),
+                        Err(e) => {
+                            debug!("Error on connecting to remote server: {}", e);
+                            reply_data[1] = GENERAL_SOCKS_SERVER_FAILURE_REPLY;
+                            write_all(socket, reply_data)
+                                .and_then(|_| tokio_err!("Connecting to target server failure"))
+                                .into_box()
+                        }
                     }
-                }
-            })
+                })
+                .into_box()
         });
 
         let passing = reply.and_then(|(socket, conn)| {
@@ -246,6 +258,10 @@ where
             })
             .into_box()
     }
+}
+
+pub trait Router {
+    fn route(&self, from: SocketAddr, to: SocketAddr) -> Box<Proxy>;
 }
 
 struct Transfer {

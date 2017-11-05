@@ -11,7 +11,7 @@ mod socks;
 
 pub use self::socks::Socks5;
 
-pub trait Proxy: Sized {
+pub trait Proxy {
     fn connect(&self, handle: Handle)
         -> Box<Future<Item = TcpStream, Error = io::Error> + 'static>;
 }
