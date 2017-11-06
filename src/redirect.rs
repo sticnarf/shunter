@@ -1,12 +1,33 @@
-use redirect::Proxy;
+use std::net::SocketAddr;
 use futures::Future;
 use tokio_core::reactor::Handle;
 use tokio_core::net::TcpStream;
-use tokio_io::io::{write_all, read_exact};
 use std::io;
-use std::net::SocketAddr;
-use num::FromPrimitive;
-use socks::*;
+use super::*;
+
+pub trait Proxy {
+    fn connect(&self, handle: Handle)
+        -> Box<Future<Item = TcpStream, Error = io::Error> + 'static>;
+}
+
+pub struct Direct {
+    addr: SocketAddr,
+}
+
+impl Direct {
+    pub fn new(addr: SocketAddr) -> Direct {
+        Direct { addr }
+    }
+}
+
+impl Proxy for Direct {
+    fn connect(
+        &self,
+        handle: Handle,
+    ) -> Box<Future<Item = TcpStream, Error = io::Error> + 'static> {
+        TcpStream::connect(&self.addr, &handle).into_box()
+    }
+}
 
 pub struct Socks5 {
     proxy_addr: SocketAddr,
@@ -33,8 +54,10 @@ macro_rules! validate_awk_addr {
 }
 
 impl Proxy for Socks5 {
-    fn connect(&self, handle: Handle)
-               -> Box<Future<Item=TcpStream, Error=io::Error> + 'static> {
+    fn connect(
+        &self,
+        handle: Handle,
+    ) -> Box<Future<Item = TcpStream, Error = io::Error> + 'static> {
         let connect = TcpStream::connect(&self.proxy_addr, &handle).and_then(|conn| {
             write_all(conn, [SOCKS5_VERSION, 1, NO_AUTHENTICATION_REQUIRED]).map(|(conn, _)| conn)
         });
@@ -70,41 +93,41 @@ impl Proxy for Socks5 {
         });
 
         let ack = req.and_then(move |conn| {
-            read_exact(conn, [0u8; 4]).and_then(|(conn, buf)| {
-                if buf[0] != SOCKS5_VERSION {
-                    return tokio_err!("Unsupported SOCKS version");
-                }
-                if buf[1] != SUCCEEDED_REPLY {
-                    return tokio_err!("Request not succeeded");
-                }
-                if buf[2] != RESERVED_CODE {
-                    return tokio_err!(format!("Expect reserved code, but {}", buf[2]));
-                }
-                match FromPrimitive::from_u8(buf[3]) {
-                    Some(aytp) => Ok((conn, aytp)),
-                    None => tokio_err!("Unknown AYTP"),
-                }
-            }).and_then(move |(conn, aytp)| match aytp {
-                AYTP::IPv4 => {
-                    read_exact(conn, [0u8; 6])
-                        .and_then(move |(conn, buf)| validate_awk_addr!(buf, target_addr, conn))
-                        .into_box()
-                }
-                AYTP::IPv6 => {
-                    read_exact(conn, [0u8; 18])
-                        .and_then(move |(conn, buf)| validate_awk_addr!(buf, target_addr, conn))
-                        .into_box()
-                }
-                AYTP::DomainName => {
-                    read_exact(conn, [0u8])
+            read_exact(conn, [0u8; 4])
+                .and_then(|(conn, buf)| {
+                    if buf[0] != SOCKS5_VERSION {
+                        return tokio_err!("Unsupported SOCKS version");
+                    }
+                    if buf[1] != SUCCEEDED_REPLY {
+                        return tokio_err!("Request not succeeded");
+                    }
+                    if buf[2] != RESERVED_CODE {
+                        return tokio_err!(format!("Expect reserved code, but {}", buf[2]));
+                    }
+                    match FromPrimitive::from_u8(buf[3]) {
+                        Some(aytp) => Ok((conn, aytp)),
+                        None => tokio_err!("Unknown AYTP"),
+                    }
+                })
+                .and_then(move |(conn, aytp)| match aytp {
+                    AYTP::IPv4 => read_exact(conn, [0u8; 6])
+                        .and_then(move |(conn, buf)| {
+                            validate_awk_addr!(buf, target_addr, conn)
+                        })
+                        .into_box(),
+                    AYTP::IPv6 => read_exact(conn, [0u8; 18])
+                        .and_then(move |(conn, buf)| {
+                            validate_awk_addr!(buf, target_addr, conn)
+                        })
+                        .into_box(),
+                    AYTP::DomainName => read_exact(conn, [0u8])
                         .map(|(conn, buf)| (conn, buf[0]))
                         .and_then(|(conn, domain_len)| {
                             read_exact(conn, vec![0u8; (domain_len as usize) + 2])
                                 .map(|(conn, _)| conn)
                         })
-                        .into_box()
-                }
-            })
+                        .into_box(),
+                })
         });
 
         ack.into_box()
