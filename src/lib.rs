@@ -1,4 +1,3 @@
-extern crate clap;
 extern crate futures;
 extern crate num;
 extern crate num_cpus;
@@ -187,7 +186,6 @@ where
             let connection = proxy.connect(handle.clone());
             connection
                 .then(move |res| {
-                    debug!("Connecting {}", target_addr);
                     let mut reply_data = vec![SOCKS5_VERSION, SUCCEEDED_REPLY, RESERVED_CODE];
                     match target_addr {
                         SocketAddr::V4(addr) => {
@@ -231,9 +229,12 @@ where
                     };
 
                     match res {
-                        Ok(conn) => write_all(socket, reply_data)
-                            .map(|(socket, _)| (socket, conn))
-                            .into_box(),
+                        Ok(conn) => {
+                            debug!("Connected to {}", target_addr);
+                            write_all(socket, reply_data)
+                                .map(|(socket, _)| (socket, conn))
+                                .into_box()
+                        }
                         Err(e) => {
                             debug!("Error on connecting to remote server: {}", e);
                             reply_data[1] = GENERAL_SOCKS_SERVER_FAILURE_REPLY;
