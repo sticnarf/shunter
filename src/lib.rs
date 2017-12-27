@@ -60,8 +60,7 @@ impl<R> Shunter<R>
 where
     R: Router + 'static,
 {
-    pub fn create(bind_addr: SocketAddr) -> io::Result<Shunter<R>> {
-        let ev_loop = Core::new()?;
+    pub fn create(bind_addr: SocketAddr, ev_loop: Core) -> io::Result<Shunter<R>> {
         let listener = TcpListener::bind(&bind_addr, &ev_loop.handle())?;
         Ok(Shunter {
             ev_loop,
